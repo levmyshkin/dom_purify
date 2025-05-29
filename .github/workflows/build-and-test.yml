@@ -8,6 +8,8 @@ on:
   push:
     branches:
       - main
+      - 3.x
+      - 2.x
   pull_request:
 
 jobs:
@@ -16,13 +18,13 @@ jobs:
 
     strategy:
       matrix:
-        node-version: [14.x, 16.x, 17.x, 18.x]
+        node-version: [18.x, 19.x, 20.x, 21.x, 22.x, 23.x]
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Setup Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
           cache: 'npm'
@@ -33,11 +35,13 @@ jobs:
       - name: Lint
         run: npm run lint
       - name: Test
-        uses: GabrielBB/xvfb-action@v1.6
+        uses: GabrielBB/xvfb-action@v1.7
         with:
           run: npm run test:ci
         env:
-          TEST_BROWSERSTACK: ${{ startsWith(matrix.node-version, '18') }}
-          TEST_PROBE_ONLY: ${{ github.ref != 'refs/heads/main' }}
+          TEST_BROWSERSTACK: ${{ startsWith(matrix.node-version, '22') }}
+          TEST_PROBE_ONLY: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/2.x' }}
           BS_USERNAME: ${{ secrets.BS_USERNAME }}
           BS_ACCESSKEY: ${{ secrets.BS_ACCESSKEY }}
+      - name: Verify TypeScript
+        run: npm run verify-typescript

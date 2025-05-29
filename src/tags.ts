@@ -88,9 +88,11 @@ export const html = freeze([
   'ruby',
   's',
   'samp',
+  'search',
   'section',
   'select',
   'shadow',
+  'slot',
   'small',
   'source',
   'spacer',
@@ -118,9 +120,8 @@ export const html = freeze([
   'var',
   'video',
   'wbr',
-]);
+] as const);
 
-// SVG
 export const svg = freeze([
   'svg',
   'a',
@@ -135,6 +136,8 @@ export const svg = freeze([
   'defs',
   'desc',
   'ellipse',
+  'enterkeyhint',
+  'exportparts',
   'filter',
   'font',
   'g',
@@ -142,18 +145,21 @@ export const svg = freeze([
   'glyphref',
   'hkern',
   'image',
+  'inputmode',
   'line',
   'lineargradient',
   'marker',
   'mask',
   'metadata',
   'mpath',
+  'part',
   'path',
   'pattern',
   'polygon',
   'polyline',
   'radialgradient',
   'rect',
+  'slot',
   'stop',
   'style',
   'switch',
@@ -165,7 +171,7 @@ export const svg = freeze([
   'tspan',
   'view',
   'vkern',
-]);
+] as const);
 
 export const svgFilters = freeze([
   'feBlend',
@@ -176,6 +182,7 @@ export const svgFilters = freeze([
   'feDiffuseLighting',
   'feDisplacementMap',
   'feDistantLight',
+  'feDropShadow',
   'feFlood',
   'feFuncA',
   'feFuncB',
@@ -192,7 +199,7 @@ export const svgFilters = freeze([
   'feSpotLight',
   'feTile',
   'feTurbulence',
-]);
+] as const);
 
 // List of SVG elements that are disallowed by default.
 // We still need to know them so that we can do namespace
@@ -203,7 +210,6 @@ export const svgDisallowed = freeze([
   'color-profile',
   'cursor',
   'discard',
-  'fedropshadow',
   'font-face',
   'font-face-format',
   'font-face-name',
@@ -222,7 +228,7 @@ export const svgDisallowed = freeze([
   'solidcolor',
   'unknown',
   'use',
-]);
+] as const);
 
 export const mathMl = freeze([
   'math',
@@ -254,7 +260,8 @@ export const mathMl = freeze([
   'mtr',
   'munder',
   'munderover',
-]);
+  'mprescripts',
+] as const);
 
 // Similarly to SVG, we want to know all MathML elements,
 // even those that we disallow by default.
@@ -274,6 +281,6 @@ export const mathMlDisallowed = freeze([
   'annotation-xml',
   'mprescripts',
   'none',
-]);
+] as const);
 
-export const text = freeze(['#text']);
+export const text = freeze(['#text'] as const);

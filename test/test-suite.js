@@ -133,6 +133,21 @@
         );
       }
     );
+    QUnit.test('Config-Flag tests: ALLOW_SELF_CLOSE_IN_ATTR', function (assert) {
+      // ALLOW_SELF_CLOSE_IN_ATTR
+      assert.equal(
+        DOMPurify.sanitize('<a href="#" class="foo <br/>">abc</a>', {
+          ALLOW_SELF_CLOSE_IN_ATTR: false,
+        }),
+        '<a href="#">abc</a>'
+      );
+      assert.equal(
+        DOMPurify.sanitize('<a href="#" class="foo <br/>">abc</a>', {
+          ALLOW_SELF_CLOSE_IN_ATTR: true,
+        }),
+        '<a href="#" class="foo <br/>">abc</a>'
+      );
+    });
     QUnit.test('Config-Flag tests: ALLOW_DATA_ATTR', function (assert) {
       // ALLOW_DATA_ATTR
       assert.equal(
@@ -436,7 +451,7 @@
         DOMPurify.sanitize('<img src="x" name="getElementById">', {
           SANITIZE_DOM: false,
         }),
-        '<img name="getElementById" src="x">'
+        '<img src="x" name="getElementById">'
       );
       assert.equal(
         DOMPurify.sanitize('<img src="x" name="getElementById">', {
@@ -749,8 +764,8 @@
                 allowCustomizedBuiltInElements: true,
               },
             }
-          ), // DOMPurify swaps the order of attributes here!
-          '<foo-bar forbidden="true" baz="foobar"></foo-bar><div is=""></div>'
+          ),
+          '<foo-bar baz="foobar" forbidden="true"></foo-bar><div is=""></div>'
         );
         assert.equal(
           DOMPurify.sanitize(
@@ -787,6 +802,21 @@
           ),
           '<my-paragraph><span slot="my-text">test</span></my-paragraph>'
         );
+      }
+    );
+    QUnit.test(
+      'CUSTOM_ELEMENT_HANDLING config values of null do not throw a TypeError.',
+      function (assert) {
+        DOMPurify.sanitize('', {
+          CUSTOM_ELEMENT_HANDLING: {
+            tagNameCheck: null,
+            attributeNameCheck: null,
+            allowCustomizedBuiltInElements: null,
+          },
+        });
+    
+        // Don't see a great way to assert NOT throws...
+        assert.ok(true);
       }
     );
     QUnit.test('Test dirty being an array', function (assert) {
@@ -829,16 +859,45 @@
       assert.strictEqual(DOMPurify({}).isSupported, false);
       assert.strictEqual(DOMPurify({}).sanitize, undefined);
       assert.strictEqual(
-        typeof DOMPurify({ document: 'not really a document' }).version,
+        typeof DOMPurify({
+          document: 'not really a document',
+          Element: window.Element,
+        }).version,
         'string'
       );
       assert.strictEqual(
-        DOMPurify({ document: 'not really a document' }).isSupported,
+        DOMPurify({
+          document: 'not really a document',
+          Element: window.Element,
+        }).isSupported,
         false
       );
       assert.strictEqual(
-        DOMPurify({ document: 'not really a document' }).sanitize,
+        DOMPurify({
+          document: 'not really a document',
+          Element: window.Element,
+        }).sanitize,
         undefined
+      );
+      assert.strictEqual(
+        typeof DOMPurify({ document, Element: undefined }).version,
+        'string'
+      );
+      assert.strictEqual(
+        DOMPurify({ document, Element: undefined }).isSupported,
+        false
+      );
+      assert.strictEqual(
+        DOMPurify({ document, Element: undefined }).sanitize,
+        undefined
+      );
+      assert.strictEqual(
+        typeof DOMPurify({ document, Element: window.Element }).version,
+        'string'
+      );
+      assert.strictEqual(
+        typeof DOMPurify({ document, Element: window.Element }).sanitize,
+        'function'
       );
       assert.strictEqual(typeof DOMPurify(window).version, 'string');
       assert.strictEqual(typeof DOMPurify(window).sanitize, 'function');
@@ -868,23 +927,6 @@
         assert.equal(resultPlain, '123');
         assert.equal(resultImport.ownerDocument, document);
         assert.equal(resultBody, '123<img>');
-      }
-    );
-    // Test to check against a hang in MSIE (#89)
-    QUnit.test(
-      'sanitize() should not hang on MSIE when hook changes textContent',
-      function (assert) {
-        DOMPurify.addHook('afterSanitizeElements', function (node) {
-          if (node.nodeType && node.nodeType === document.TEXT_NODE) {
-            node.textContent = 'foo';
-          }
-          return node;
-        });
-        var dirty =
-          '<div><p>This is a beatufiul text</p><p>This is too</p></div>';
-        var modified = '<div><p>foo</p><p>foo</p></div>';
-        assert.equal(DOMPurify.sanitize(dirty), modified);
-        DOMPurify.removeHooks('afterSanitizeElements');
       }
     );
     // Tests to ensure that a configuration can be set and cleared
@@ -1111,9 +1153,9 @@
         assert.equal(DOMPurify.removed.length, 0);
       }
     );
-    // Tests to make sure that the node scanning feature delivers acurate results on all browsers
+    // Tests to make sure that the node scanning feature delivers accurate results on all browsers
     QUnit.test(
-      'DOMPurify should deliver acurate results when sanitizing nodes 1',
+      'DOMPurify should deliver accurate results when sanitizing nodes 1',
       function (assert) {
         var clean = DOMPurify.sanitize(document.createElement('td'));
         assert.equal(clean, '<td></td>');
@@ -1162,8 +1204,8 @@
           { ADD_URI_SAFE_ATTR: ['poster'] }
         );
         assert.contains(clean, [
-          '<div style="color: red" poster="x:y">Test</div>',
-          '<div style="color: red;" poster="x:y">Test</div>',
+          '<div poster="x:y" style="color: red">Test</div>',
+          '<div poster="x:y" style="color: red;">Test</div>',
         ]);
 
         clean = DOMPurify.sanitize(
@@ -1173,17 +1215,6 @@
           '<div style="color: red">Test</div>',
           '<div style="color: red;">Test</div>',
         ]);
-      }
-    );
-    // Test to make sure that empty HTML doesn't return null on MSIE11 (#198)
-    QUnit.test(
-      "Empty HTML shouldn't return null on MSIE11 in RETURN_DOM_FRAGMENT mode",
-      function (assert) {
-        var clean = DOMPurify.sanitize('', {
-          RETURN_DOM: true,
-          RETURN_DOM_FRAGMENT: true,
-        });
-        assert.equal(typeof clean, 'object');
       }
     );
     // Tests to make sure that FORCE_BODY pushes elements to document.body (#199)
@@ -1343,9 +1374,9 @@
         ),
         [
           '<svg><feblend in="SourceGraphic" mode="multiply"></feblend></svg>',
-          '<svg><feblend mode="multiply" in="SourceGraphic"></feblend></svg>',
-          '<svg><feBlend mode="multiply" in="SourceGraphic"></feBlend></svg>',
-          '<svg><feBlend mode="multiply" in="SourceGraphic"></feBlend></svg>',
+          '<svg><feblend in="SourceGraphic" mode="multiply"></feblend></svg>',
+          '<svg><feBlend in="SourceGraphic" mode="multiply"></feBlend></svg>',
+          '<svg><feBlend in="SourceGraphic" mode="multiply"></feBlend></svg>',
           '<svg xmlns="http://www.w3.org/2000/svg"><feBlend in="SourceGraphic" mode="multiply" /></svg>',
           '<svg xmlns="http://www.w3.org/2000/svg" />',
         ]
@@ -1428,6 +1459,21 @@
         });
         assert.equal(str, test.expected);
       });
+    });
+    QUnit.test('Ensure ALLOWED_URI_REGEXP is not cached', function(assert) {
+      const 
+        dirty = '<img src="https://different.com">',
+        expected = '<img src="https://different.com">';
+
+      assert.equal(DOMPurify.sanitize(dirty), expected);
+
+      // sanitize with a custom URI regexp
+      assert.equal(DOMPurify.sanitize('<img src="https://test.com">', {
+        ALLOWED_URI_REGEXP: /test\.com/i
+      }), '<img src="https://test.com">');
+
+      // ensure that the previous regexp does not affect future sanitize calls
+      assert.equal(DOMPurify.sanitize(dirty), expected);
     });
     QUnit.test(
       'Avoid freeze when using tables and ALLOW_TAGS',
@@ -1571,7 +1617,7 @@
       }
     );
     QUnit.test(
-      'Test for less agressive mXSS handling, See #369',
+      'Test for less aggressive mXSS handling, See #369',
       function (assert) {
         var config = {
           FORBID_TAGS: ['svg', 'math'],
@@ -1625,7 +1671,7 @@
           config
         );
         assert.contains(clean, [
-          '<img y="<x" x="/><img src=x onerror=alert(1)>">', // jsdom
+          '<img x="/><img src=x onerror=alert(1)>" y="<x">', // jsdom
           '<img y="<x">',
           '<img y="&lt;x">',
           '<img y="<x">',
@@ -1686,29 +1732,14 @@
         ]);
       }
     );
-    QUnit.test(
-      'Test protection from prototype pollution attacks',
-      function (assert) {
-        const obj = JSON.parse(
-          '{"ALLOWED_ATTR":["onerror","src"], "documentMode":9}'
-        );
-        try {
-          for (let [k, v] of Object.entries(obj)) {
-            Object.prototype[k] = v;
-          }
-        } catch (e) {}
-        var clean = DOMPurify.sanitize('<img src=x onerror=alert(1)>');
-        assert.equal(clean, '<img src="x">');
-      }
-    );
     QUnit.test('Test if namespaces are properly enforced', function (assert) {
       var tests = [
         {
           test:
             '<svg><desc><canvas></canvas><textarea></textarea></desc></svg>',
           expected: [
-            '<svg><desc><canvas></canvas><textarea></textarea></desc></svg>',
-            '<svg xmlns="http://www.w3.org/2000/svg"><desc><canvas></canvas><textarea></textarea></desc></svg>',
+            '<svg><desc></desc></svg>',
+            '<svg xmlns="http://www.w3.org/2000/svg"><desc></desc></svg>',
             '<svg xmlns="http://www.w3.org/2000/svg" />',
           ],
         },
@@ -1733,9 +1764,9 @@
         {
           test: '<svg><math></math><title><math></math></title></svg>',
           expected: [
-            '<svg><title><math></math></title></svg>',
+            '<svg><title></title></svg>',
             '<svg xmlns="http://www.w3.org/2000/svg" />',
-            '<svg xmlns="http://www.w3.org/2000/svg"><title><math></math></title></svg>',
+            '<svg xmlns="http://www.w3.org/2000/svg"><title></title></svg>',
           ],
         },
         {
@@ -1774,7 +1805,7 @@
         {
           test: '<polyline points="0 0"></polyline>',
           config: { NAMESPACE: 'http://www.w3.org/1999/xhtml' },
-          expected: ['', '<polyline points="0 0"></polyline>'], // IE10
+          expected: [''],
         },
         {
           test: '<mi></mi>',
@@ -1790,7 +1821,7 @@
         {
           test: '<polyline points="0 0"></polyline>',
           config: { NAMESPACE: 'http://www.w3.org/1998/Math/MathML' },
-          expected: ['', '<polyline points="0 0"></polyline>'], // IE10
+          expected: [''],
         },
         {
           test: '<mi></mi>',
@@ -2087,6 +2118,90 @@
       // set the same hook
       DOMPurify.addHook(entryPoint, hookFunction);
       assert.equal(DOMPurify.sanitize(dirty), expected);
+
+      // cleanup hook
+      DOMPurify.removeHook(entryPoint);
+    });
+
+    QUnit.test('removeHook allows specifying the hook to remove', function (assert) {
+      const entryPoint = 'afterSanitizeAttributes';
+      const dirty = '<div class="original"></div>';
+      const expected = '<div class="original first third"></div>';
+
+      const firstHook = function (node) {
+        node.classList.add('first');
+      };
+      const secondHook = function (node) {
+        node.classList.add('second');
+      };
+      const thirdHook = function (node) {
+        node.classList.add('third');
+      };
+
+      DOMPurify.addHook(entryPoint, firstHook);
+      DOMPurify.addHook(entryPoint, secondHook);
+      DOMPurify.addHook(entryPoint, thirdHook);
+
+      // removes the specified hook
+      assert.strictEqual(DOMPurify.removeHook(entryPoint, secondHook), secondHook);
+
+      // can’t remove it again
+      assert.strictEqual(DOMPurify.removeHook(entryPoint, secondHook), undefined);
+
+      // removed hook isn’t used during sanitize
+      assert.strictEqual(DOMPurify.sanitize(dirty), expected);
+
+      // cleanup hooks
+      DOMPurify.removeHook(entryPoint, firstHook);
+      DOMPurify.removeHook(entryPoint, thirdHook);
+    });
+    
+    QUnit.test('Test proper removal of annotation-xml w. custom elements', function (assert) {
+      const dirty  = '<svg><annotation-xml><foreignobject><style><!--</style><p id="--><img src=\'x\' onerror=\'alert(1)\'>">';
+      const config = { 
+        CUSTOM_ELEMENT_HANDLING: { tagNameCheck: /.*/ },
+        FORBID_CONTENTS: [""] 
+      };
+      const expected = '<svg></svg>';
+      let clean = DOMPurify.sanitize(dirty, config);
+      assert.contains(clean, expected);
+    });
+    
+    QUnit.test('Test proper handling of attributes with RETURN_DOM', function (assert) {
+      const dirty  = '<body onload="alert(1)">&lt;a<!-- <f --></body>';
+      const config = { 
+        RETURN_DOM: true 
+      };
+      const expected = '<body>&lt;a</body>';
+      let clean = DOMPurify.sanitize(dirty, config);
+      
+      let iframe = document.createElement('iframe')
+      iframe.srcdoc = `<html><head></head>${clean.outerHTML}</html>`
+      document.body.appendChild(iframe); // alert test
+      assert.contains(clean.outerHTML, expected);
+    });
+    
+    QUnit.test('Test proper handling of data-attribiutes in XML modes', function (assert) {
+      const dirty  = '<svg width="800" height="600" xmlns="http://www.w3.org/2000/svg"><a xmlns:data-slonser="http://www.w3.org/1999/xlink" data-slonser:href="javascript:alert(1)"><text  x="20" y="35">Click me!</text></a></svg>';
+      const config = { 
+        PARSER_MEDIA_TYPE: 'application/xhtml+xml'
+      };
+      const expected = [
+        '<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"800\" height=\"600\"><a><text x=\"20\" y=\"35\">Click me!</text></a></svg>',
+        '<svg width=\"800\" height=\"600\" xmlns=\"http://www.w3.org/2000/svg\"><a><text x=\"20\" y=\"35\">Click me!</text></a></svg>'
+      ];
+      let clean = DOMPurify.sanitize(dirty, config);
+      assert.contains(clean, expected);
+    });
+
+    QUnit.test('Expect the same results when using ALLOWED_URI_REGEXP with the g flag', function (assert) {
+      const dirty  = '<img src="blob:http://localhost:5173/84c49be9-3352-4407-b066-7b5b4d46c52a"><a epub:type="noteref" href="epub:EPUB/xhtml/#footnote"></a><img src="blob:http://localhost:5173/84c49be9-3352-4407" >';
+      const config = { 
+        ALLOWED_URI_REGEXP: /^(blob|https|epub|filepos|kindle)/gi,
+      };
+      const expected = '<img src=\"blob:http://localhost:5173/84c49be9-3352-4407-b066-7b5b4d46c52a\"><a href=\"epub:EPUB/xhtml/#footnote\"></a><img src=\"blob:http://localhost:5173/84c49be9-3352-4407\">';
+      let clean = DOMPurify.sanitize(dirty, config);
+      assert.strictEqual(clean, expected);
     });
   };
 });
