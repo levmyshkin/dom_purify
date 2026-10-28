@@ -1,6 +1,4 @@
-/* eslint-disable @typescript-eslint/indent */
-
-import type { TrustedTypePolicy } from 'trusted-types/lib';
+import type { TrustedTypePolicy } from 'trusted-types/lib/index.js';
 
 /**
  * Configuration to control DOMPurify behavior.
@@ -8,8 +6,13 @@ import type { TrustedTypePolicy } from 'trusted-types/lib';
 export interface Config {
   /**
    * Extend the existing array of allowed attributes.
+   * Can be an array of attribute names, or a function that receives
+   * the attribute name and tag name to determine if the attribute is allowed.
    */
-  ADD_ATTR?: string[] | undefined;
+  ADD_ATTR?:
+    | string[]
+    | ((attributeName: string, tagName: string) => boolean)
+    | undefined;
 
   /**
    * Extend the existing array of elements that can use Data URIs.
@@ -18,8 +21,10 @@ export interface Config {
 
   /**
    * Extend the existing array of allowed tags.
+   * Can be an array of tag names, or a function that receives
+   * the tag name to determine if the tag is allowed.
    */
-  ADD_TAGS?: string[] | undefined;
+  ADD_TAGS?: string[] | ((tagName: string) => boolean) | undefined;
 
   /**
    * Extend the existing array of elements that are safe for URI-like values (be careful, XSS risk).
@@ -91,7 +96,7 @@ export interface Config {
      */
     attributeNameCheck?:
       | RegExp
-      | ((attributeName: string) => boolean)
+      | ((attributeName: string, tagName?: string) => boolean)
       | null
       | undefined;
 
@@ -110,6 +115,11 @@ export interface Config {
    * Add child elements to be removed when their parent is removed.
    */
   FORBID_CONTENTS?: string[] | undefined;
+
+  /**
+   * Extend the existing or default array of forbidden content elements.
+   */
+  ADD_FORBID_CONTENTS?: string[] | undefined;
 
   /**
    * Add elements to block-list.
@@ -205,7 +215,7 @@ export interface Config {
   /**
    * Supplied policy must define `createHTML` and `createScriptURL`.
    */
-  TRUSTED_TYPES_POLICY?: TrustedTypePolicy | undefined;
+  TRUSTED_TYPES_POLICY?: TrustedTypePolicy | null | undefined;
 
   /**
    * Controls categories of allowed elements.
@@ -236,7 +246,7 @@ export interface UseProfilesConfig {
   svg?: boolean | undefined;
 
   /**
-   * Allow all save SVG Filters.
+   * Allow all safe SVG Filters.
    */
   svgFilters?: boolean | undefined;
 

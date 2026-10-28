@@ -25,6 +25,26 @@ export default [
       "expected": "<svg><defs><filter id=\"f1\"><feGaussianBlur in=\"SourceGraphic\" stdDeviation=\"15\"></feGaussianBlur></filter></defs><rect width=\"90\" height=\"90\" stroke=\"green\" stroke-width=\"3\" fill=\"yellow\" filter=\"url(#f1)\"></rect></svg>"
      },
   {
+      "title": "Keep the SVG dominant-baseline presentation attribute (see #1525)",
+      "payload": "<svg><text dominant-baseline=\"middle\">x</text></svg>",
+      "expected": "<svg><text dominant-baseline=\"middle\">x</text></svg>"
+  },
+  {
+      "title": "Keep the SVG text-orientation presentation attribute (see #1525)",
+      "payload": "<svg><text text-orientation=\"upright\">y</text></svg>",
+      "expected": "<svg><text text-orientation=\"upright\">y</text></svg>"
+  },
+  {
+      "title": "Keep the SVG pointer-events presentation attribute",
+      "payload": "<svg><rect pointer-events=\"none\" width=\"10\" height=\"10\"/></svg>",
+      "expected": "<svg><rect pointer-events=\"none\" width=\"10\" height=\"10\"></rect></svg>"
+  },
+  {
+      "title": "Keep the SVG vector-effect presentation attribute (see #447)",
+      "payload": "<svg><circle vector-effect=\"non-scaling-stroke\" cx=\"0\" cy=\"0\" r=\"30\"/></svg>",
+      "expected": "<svg><circle vector-effect=\"non-scaling-stroke\" cx=\"0\" cy=\"0\" r=\"30\"></circle></svg>"
+  },
+  {
       "title": "safe usage of URI-like attribute values (see #135)",
       "payload": "<b href=\"javascript:alert(1)\" title=\"javascript:alert(2)\"></b>",
       "expected": "<b title=\"javascript:alert(2)\"></b>"
@@ -556,7 +576,8 @@ export default [
           "<div id=\"102\"><img src=\"x` `&lt;script&gt;alert(102)&lt;/script&gt;\">//[\"'`--&gt;]]&gt;]</div>",
           "<div id=\"102\"><img src=\"x` `<script>alert(102)</script>\">//[\"'`--&gt;]]&gt;]</div>",
           "<div id=\"102\"><img src=\"x%60%20%60%3Cscript%3Ealert%28102%29%3C/script%3E\">//[\"'`--&gt;]]&gt;]</div>",
-          "<div id=\"102\">//[\"'`--&gt;]]&gt;]</div>"
+          "<div id=\"102\">//[\"'`--&gt;]]&gt;]</div>",
+		  "<div id=\"102\"><img>//[\"'`--&gt;]]&gt;]</div>"
       ]
   }, {
       "payload": "<div id=\"103\"><script>history.pushState(0,0,'/i/am/somewhere_else');</script>//[\"'`-->]]>]</div><div id=\"104\"><svg xmlns=\"http://www.w3.org/2000/svg\" id=\"foo\">\n<x xmlns=\"http://www.w3.org/2001/xml-events\" event=\"load\" observer=\"foo\" handler=\"data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%0A%3Chandler%20xml%3Aid%3D%22bar%22%20type%3D%22application%2Fecmascript%22%3E alert(104) %3C%2Fhandler%3E%0A%3C%2Fsvg%3E%0A#bar\"/>\n</svg>//[\"'`-->]]>]</div>",
@@ -698,7 +719,8 @@ export default [
       "payload": "<div id=\"129\"><svg><image style='filter:url(\"data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22><script>parent.alert(129)</script></svg>\")'>\n<!--\nSame effect with\n<image filter='...'>\n-->\n</svg>//[\"'`-->]]>]</div>",
       "expected": [
           "<div id=\"129\"><svg><image style=\"filter:url(&quot;data:image/svg+xml,&lt;svg xmlns=%22http://www.w3.org/2000/svg%22&gt;&lt;script&gt;parent.alert(129)&lt;/script&gt;&lt;/svg&gt;&quot;)\">\n\n</image></svg>//[\"'`--&gt;]]&gt;]</div>",
-          "<div id=\"129\"><svg><image style=\"filter:url(&quot;data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22><script>parent.alert(129)</script></svg>&quot;)\">\n\n</image></svg>//[\"'`--&gt;]]&gt;]</div>"
+          "<div id=\"129\"><svg><image style=\"filter:url(&quot;data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22><script>parent.alert(129)</script></svg>&quot;)\">\n\n</image></svg>//[\"'`--&gt;]]&gt;]</div>",
+		  "<div id=\"129\"><svg><image>\n\n</image></svg>//[\"'`--&gt;]]&gt;]</div>"
       ]
   }, {
       "title": "MathML",
@@ -723,7 +745,9 @@ export default [
       "expected": [
           "<div id=\"134\">\n<img alt=\"%></xmp><img src=xx onerror=alert(134)//\">\n\n %&gt;/\nalert(2)\n\n\nXXX\n<style>\n*['<!--']{}\n</style>\n--&gt;{}\n*{color:red}//[\"'`--&gt;]]&gt;]</div>",
           "<div id=\"134\">\n<img alt=\"%&gt;&lt;/xmp&gt;&lt;img src=xx onerror=alert(134)//\">\n\n %&gt;/\nalert(2)\n\n\nXXX\n<style>\n*['<!--']{}\n</style>\n-&gt;{}\n*{color:red}//[\"'`--&gt;]]&gt;]</div>",
-          "<div id=\"134\">\n<img alt=\"%></xmp><img src=xx onerror=alert(134)//\">\n\n %&gt;/\nalert(2)\n\n\nXXX\n\n--&gt;{}\n*{color:red}//[\"'`--&gt;]]&gt;]</div>"
+          "<div id=\"134\">\n<img alt=\"%></xmp><img src=xx onerror=alert(134)//\">\n\n %&gt;/\nalert(2)\n\n\nXXX\n\n--&gt;{}\n*{color:red}//[\"'`--&gt;]]&gt;]</div>",
+		  "<div id=\"134\">\n<img alt=\"%&gt;&lt;/xmp&gt;&lt;img src=xx onerror=alert(134)//\">\n\n %&gt;/\nalert(2)\n\n\nXXX\n\n--&gt;{}\n*{color:red}//[\"'`--&gt;]]&gt;]</div>",
+		  "<div id=\"134\">\n<img>\n\n %&gt;/\nalert(2)\n\n\nXXX\n\n--&gt;{}\n*{color:red}//[\"'`--&gt;]]&gt;]</div>"
       ]
   }, {
       "title": "SVG",
@@ -918,6 +942,21 @@ export default [
       "title":"Testing support for search",
       "payload": "<header><h1>Movie website</h1><search><form action=\"./search/\"><label for=\"movie\">Find a Movie</label><input type=\"search\" id=\"movie\" name=\"q\" /><button type=\"submit\">Search</button></form></search></header>",
       "expected": "<header><h1>Movie website</h1><search><form action=\"./search/\"><label for=\"movie\">Find a Movie</label><input type=\"search\" id=\"movie\" name=\"q\"><button type=\"submit\">Search</button></form></search></header>"
-  }
+  }, {
+    "title": "Does not remove the SVG 'mask-type' attribute",
+    "payload": "<svg viewBox=\"0 0 100 100\" xmlns=\"http://www.w3.org/2000/svg\"><mask id=\"a\" mask-type=\"alpha\"><rect width=\"100%\" height=\"100%\" fill=\"rgb(10% 10% 10% / 0.4)\"></rect><circle cx=\"50\" cy=\"50\" r=\"35\" fill=\"rgb(90% 90% 90% / 0.6)\"></circle></mask><rect width=\"45\" height=\"45\" fill=\"red\" mask=\"url(#a)\"></rect></svg>",
+    "expected": "<svg viewBox=\"0 0 100 100\" xmlns=\"http://www.w3.org/2000/svg\"><mask id=\"a\" mask-type=\"alpha\"><rect width=\"100%\" height=\"100%\" fill=\"rgb(10% 10% 10% / 0.4)\"></rect><circle cx=\"50\" cy=\"50\" r=\"35\" fill=\"rgb(90% 90% 90% / 0.6)\"></circle></mask><rect width=\"45\" height=\"45\" fill=\"red\" mask=\"url(#a)\"></rect></svg>"
+  }, {
+    "title":"Testing support for command and commandfor",
+    "payload": "<button command=\"show-modal\" commandfor=\"dialog\">Show Modal</button>",
+    "expected": "<button command=\"show-modal\" commandfor=\"dialog\">Show Modal</button>"
+  }, {
+    "title":"Testing support for popovertarget and popovertargetaction",
+    "payload": "<button popovertargetaction=\"show\" popovertarget=\"popover\">Show Popover</button>",
+    "expected": "<button popovertargetaction=\"show\" popovertarget=\"popover\">Show Popover</button>"
+  }, {
+    "title":"Testing support for selectedcontent",
+    "payload": "<selectedcontent></selectedcontent>",
+    "expected": "<selectedcontent></selectedcontent>"
+  },
 ];
-

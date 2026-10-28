@@ -10,25 +10,29 @@ let { freeze, seal, create } = Object; // eslint-disable-line import/no-mutable-
 let { apply, construct } = typeof Reflect !== 'undefined' && Reflect;
 
 if (!freeze) {
-  freeze = function (x) {
+  freeze = function <T>(x: T): T {
     return x;
   };
 }
 
 if (!seal) {
-  seal = function (x) {
+  seal = function <T>(x: T): T {
     return x;
   };
 }
 
 if (!apply) {
-  apply = function (fun, thisValue, args) {
-    return fun.apply(thisValue, args);
+  apply = function <T>(
+    func: (thisArg: any, ...args: any[]) => T,
+    thisArg: any,
+    ...args: any[]
+  ): T {
+    return func.apply(thisArg, args);
   };
 }
 
 if (!construct) {
-  construct = function (Func, args) {
+  construct = function <T>(Func: new (...args: any[]) => T, ...args: any[]): T {
     return new Func(...args);
   };
 }
@@ -40,6 +44,11 @@ const arrayPop = unapply(Array.prototype.pop);
 const arrayPush = unapply(Array.prototype.push);
 const arraySlice = unapply(Array.prototype.slice);
 const arraySplice = unapply(Array.prototype.splice);
+const arrayIsArray = Array.isArray;
+
+const setCreate = unconstruct(Set) as () => Set<unknown>;
+const setAdd = unapply(Set.prototype.add);
+const setHas = unapply(Set.prototype.has);
 
 const stringToLowerCase = unapply(String.prototype.toLowerCase);
 const stringToString = unapply(String.prototype.toString);
@@ -48,7 +57,15 @@ const stringReplace = unapply(String.prototype.replace);
 const stringIndexOf = unapply(String.prototype.indexOf);
 const stringTrim = unapply(String.prototype.trim);
 
+const numberToString = unapply(Number.prototype.toString);
+const booleanToString = unapply(Boolean.prototype.toString);
+const bigintToString =
+  typeof BigInt === 'undefined' ? null : unapply(BigInt.prototype.toString);
+const symbolToString =
+  typeof Symbol === 'undefined' ? null : unapply(Symbol.prototype.toString);
+
 const objectHasOwnProperty = unapply(Object.prototype.hasOwnProperty);
+const objectToString = unapply(Object.prototype.toString);
 
 const regExpTest = unapply(RegExp.prototype.test);
 
@@ -78,8 +95,10 @@ function unapply<T>(
  * @param func - The constructor function to be wrapped and called.
  * @returns A new function that constructs an instance of the given constructor function with the provided arguments.
  */
-function unconstruct<T>(func: (...args: any[]) => T): (...args: any[]) => T {
-  return (...args: any[]): T => construct(func, args);
+function unconstruct<T>(
+  Func: new (...args: any[]) => T
+): (...args: any[]) => T {
+  return (...args: any[]): T => construct(Func, args);
 }
 
 /**
@@ -91,10 +110,10 @@ function unconstruct<T>(func: (...args: any[]) => T): (...args: any[]) => T {
  * @returns The modified set with added elements.
  */
 function addToSet(
-  set: Record<string, any>,
-  array: readonly any[],
+  set: Record<string, boolean>,
+  array: readonly unknown[],
   transformCaseFunc: ReturnType<typeof unapply<string>> = stringToLowerCase
-): Record<string, any> {
+): Record<string, boolean> {
   if (setPrototypeOf) {
     // Make 'in' and truthy checks like Boolean(set.constructor)
     // independent of any properties defined on Object.prototype.
@@ -102,22 +121,28 @@ function addToSet(
     setPrototypeOf(set, null);
   }
 
+  if (!arrayIsArray(array)) {
+    return set;
+  }
+
   let l = array.length;
   while (l--) {
     let element = array[l];
+
     if (typeof element === 'string') {
       const lcElement = transformCaseFunc(element);
+
       if (lcElement !== element) {
         // Config presets (e.g. tags.js, attrs.js) are immutable.
         if (!isFrozen(array)) {
-          (array as any[])[l] = lcElement;
+          (array as unknown[])[l] = lcElement;
         }
 
         element = lcElement;
       }
     }
 
-    set[element] = true;
+    set[element as string] = true;
   }
 
   return set;
@@ -154,7 +179,7 @@ function clone<T extends Record<string, any>>(object: T): T {
     const isPropertyExist = objectHasOwnProperty(object, property);
 
     if (isPropertyExist) {
-      if (Array.isArray(value)) {
+      if (arrayIsArray(value)) {
         newObject[property] = cleanArray(value);
       } else if (
         value &&
@@ -169,6 +194,64 @@ function clone<T extends Record<string, any>>(object: T): T {
   }
 
   return newObject;
+}
+
+/**
+ * Convert non-node values into strings without depending on direct property access.
+ *
+ * @param value - The value to stringify.
+ * @returns A string representation of the provided value.
+ */
+function stringifyValue(value: unknown): string {
+  switch (typeof value) {
+    case 'string': {
+      return value;
+    }
+
+    case 'number': {
+      return numberToString(value);
+    }
+
+    case 'boolean': {
+      return booleanToString(value);
+    }
+
+    case 'bigint': {
+      return bigintToString ? bigintToString(value) : '0';
+    }
+
+    case 'symbol': {
+      return symbolToString ? symbolToString(value) : 'Symbol()';
+    }
+
+    case 'undefined': {
+      return objectToString(value);
+    }
+
+    case 'function':
+    case 'object': {
+      if (value === null) {
+        return objectToString(value);
+      }
+
+      const valueAsRecord = value as Record<string, any>;
+      const valueToString = lookupGetter(valueAsRecord, 'toString');
+
+      if (typeof valueToString === 'function') {
+        const stringified = valueToString(valueAsRecord);
+
+        return typeof stringified === 'string'
+          ? stringified
+          : objectToString(stringified);
+      }
+
+      return objectToString(value);
+    }
+
+    default: {
+      return objectToString(value);
+    }
+  }
 }
 
 /**
@@ -205,10 +288,48 @@ function lookupGetter<T extends Record<string, any>>(
   return fallbackValue;
 }
 
+/**
+ * Like lookupGetter, but for accessor properties only, and returns null
+ * instead of a null-returning fallback when no getter exists on the chain.
+ * Lets a caller fall back to a direct property read in environments that
+ * lack the getter, where a fallback returning null would be indistinguishable
+ * from a legitimate null value (e.g. namespaceURI of a no-namespace element).
+ *
+ * @param object - The object (usually a prototype) to start the lookup at.
+ * @param prop - The accessor property name.
+ * @returns The unapplied getter, or null if none was found.
+ */
+function lookupAccessor<T extends Record<string, any>>(
+  object: T,
+  prop: string
+): ReturnType<typeof unapply<any>> | null {
+  while (object !== null) {
+    const desc = getOwnPropertyDescriptor(object, prop);
+
+    if (desc) {
+      return desc.get ? unapply(desc.get) : null;
+    }
+
+    object = getPrototypeOf(object);
+  }
+
+  return null;
+}
+
+function isRegex(value: unknown): value is RegExp {
+  try {
+    regExpTest(value as RegExp, '');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export {
   // Array
   arrayForEach,
   arrayIndexOf,
+  arrayIsArray,
   arrayLastIndexOf,
   arrayPop,
   arrayPush,
@@ -225,8 +346,13 @@ export {
   clone,
   create,
   objectHasOwnProperty,
+  objectToString,
   // RegExp
   regExpTest,
+  setAdd,
+  setCreate,
+  setHas,
+  isRegex,
   // String
   stringIndexOf,
   stringMatch,
@@ -234,9 +360,12 @@ export {
   stringToLowerCase,
   stringToString,
   stringTrim,
+  // Other conversion
+  stringifyValue,
   // Errors
   typeErrorCreate,
   // Other
+  lookupAccessor,
   lookupGetter,
   addToSet,
   // Reflect

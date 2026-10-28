@@ -1,7 +1,5 @@
-/* eslint-disable @typescript-eslint/indent */
-
-import type { TrustedHTML, TrustedTypesWindow } from 'trusted-types/lib';
 import type { Config, UseProfilesConfig } from './config';
+import type { DOMPurify, HooksMap, HookFunction, WindowLike } from './types';
 import * as TAGS from './tags.js';
 import * as ATTRS from './attrs.js';
 import * as EXPRESSIONS from './regexp.js';
@@ -10,10 +8,13 @@ import {
   clone,
   entries,
   freeze,
+  seal,
   arrayForEach,
+  arrayIsArray,
   arrayLastIndexOf,
   arrayPop,
   arrayPush,
+  arraySlice,
   arraySplice,
   stringMatch,
   stringReplace,
@@ -22,13 +23,34 @@ import {
   stringIndexOf,
   stringTrim,
   regExpTest,
+  setAdd,
+  setCreate,
+  setHas,
+  isRegex,
   typeErrorCreate,
+  lookupAccessor,
   lookupGetter,
   create,
   objectHasOwnProperty,
+  stringifyValue,
 } from './utils.js';
 
 export type { Config } from './config';
+
+export type {
+  DOMPurify,
+  RemovedElement,
+  RemovedAttribute,
+  HookName,
+  NodeHook,
+  ElementHook,
+  DocumentFragmentHook,
+  UponSanitizeElementHook,
+  UponSanitizeAttributeHook,
+  UponSanitizeElementHookEvent,
+  UponSanitizeAttributeHookEvent,
+  WindowLike,
+} from './types';
 
 declare const VERSION: string;
 
@@ -40,13 +62,42 @@ const NODE_TYPE = {
   cdataSection: 4,
   entityReference: 5, // Deprecated
   entityNode: 6, // Deprecated
-  progressingInstruction: 7,
+  processingInstruction: 7,
   comment: 8,
   document: 9,
   documentType: 10,
   documentFragment: 11,
   notation: 12, // Deprecated
 };
+
+/* HTML-namespace elements whose child text nodes are serialized *literally*
+   (unescaped) by the HTML fragment-serialization algorithm. Two reparse-mXSS
+   shapes ride on that literal serialization:
+     (a) an element child - a tree the HTML parser can never build, but the DOM
+         API and an XML/XHTML parse can - after which a `</tag>`-bearing text
+         sibling breaks the element open on reparse; and
+     (b) text-only content that already carries the element's OWN end tag, e.g.
+         `<style>...</style><img onerror=x>` built as a node, which the literal
+         serializer emits verbatim for the HTML parser to re-open.
+   Shape (a) is handled by the firstElementChild branch in _isUnsafeNode; shape
+   (b), and any other markup in the text, by the ELEMENT_MARKUP_PROBE branch next
+   to it. Both read textContent (the raw-serialized form for these elements)
+   rather than innerHTML, because an XML/XHTML working document serializes
+   innerHTML with `<` escaped, which silently blinds the innerHTML-based probes
+   (rule 1's second probe and FALLBACK_TAG_CLOSE) there.
+   `script` is never allow-listed, but is kept here so the guard matches the
+   serializer's own literal-text list exactly. */
+const LITERAL_TEXT_ELEMENT_NAMES = [
+  'style',
+  'script',
+  'xmp',
+  'iframe',
+  'noembed',
+  'noframes',
+  'plaintext',
+  'noscript',
+];
+const LITERAL_TEXT_ELEMENTS = freeze(addToSet({}, LITERAL_TEXT_ELEMENT_NAMES));
 
 const getGlobal = function (): WindowLike {
   return typeof window === 'undefined' ? null : window;
@@ -116,6 +167,58 @@ const _createHooksMap = function (): HooksMap {
   };
 };
 
+/**
+ * Resolve a set-valued configuration option: a fresh set built from
+ * cfg[key] when it is an own array property (seeded with a clone of
+ * options.base when given, case-normalized via options.transform),
+ * the fallback set otherwise.
+ *
+ * @param cfg the cloned, prototype-free configuration object
+ * @param key the configuration property to read
+ * @param fallback the set to use when the option is absent or not an array
+ * @param options transform and optional base set to merge into
+ * @returns the resolved set
+ */
+const _resolveSetOption = function (
+  cfg: Config,
+  key: keyof Config,
+  fallback: Record<string, boolean>,
+  options: {
+    transform: Parameters<typeof addToSet>[2];
+    base?: Record<string, boolean>;
+  }
+): Record<string, boolean> {
+  return objectHasOwnProperty(cfg, key) && arrayIsArray(cfg[key])
+    ? addToSet(
+        options.base ? clone(options.base) : {},
+        cfg[key] as readonly unknown[],
+        options.transform
+      )
+    : fallback;
+};
+
+/**
+ * Resolve an object-valued configuration option: a prototype-free clone
+ * of cfg[key] when it is an own, truthy object property, else a fresh
+ * fallback built by makeFallback (fresh on every parse, so a previous
+ * parse can never leak state into the next one).
+ *
+ * @param cfg the cloned, prototype-free configuration object
+ * @param key the configuration property to read
+ * @param makeFallback builds the fallback value when the option is absent
+ * @returns the resolved object
+ */
+const _resolveObjectOption = function <T extends Record<string, any>>(
+  cfg: Config,
+  key: keyof Config,
+  makeFallback: () => T
+): T {
+  const value = objectHasOwnProperty(cfg, key) ? cfg[key] : undefined;
+  return value && typeof value === 'object'
+    ? clone(value as T)
+    : makeFallback();
+};
+
 function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
   const DOMPurify: DOMPurify = (root: WindowLike) => createDOMPurify(root);
 
@@ -157,9 +260,51 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
 
   const cloneNode = lookupGetter(ElementPrototype, 'cloneNode');
   const remove = lookupGetter(ElementPrototype, 'remove');
+  // Clobber-safe Attr-node removal. On an HTMLFormElement a descendant named
+  // "removeAttributeNode" shadows the prototype method via
+  // [LegacyOverrideBuiltIns], so element.removeAttributeNode(attr) throws.
+  // Calling the cached Element.prototype method with the element as the
+  // receiver removes the exact live Attr node regardless of the shadowing.
+  const removeAttributeNode = lookupGetter(
+    ElementPrototype,
+    'removeAttributeNode'
+  );
   const getNextSibling = lookupGetter(ElementPrototype, 'nextSibling');
   const getChildNodes = lookupGetter(ElementPrototype, 'childNodes');
   const getParentNode = lookupGetter(ElementPrototype, 'parentNode');
+  const getShadowRoot = lookupGetter(ElementPrototype, 'shadowRoot');
+  const getAttributes = lookupGetter(ElementPrototype, 'attributes');
+  const getNodeType =
+    Node && Node.prototype ? lookupGetter(Node.prototype, 'nodeType') : null;
+  const getNodeName =
+    Node && Node.prototype ? lookupGetter(Node.prototype, 'nodeName') : null;
+  const getOwnerDocument =
+    Node && Node.prototype
+      ? lookupGetter(Node.prototype, 'ownerDocument')
+      : null;
+
+  /* Clobber-safe nodeType / nodeName reads through the cached Node.prototype
+     getters, with a direct-property fallback for environments that lack
+     Node.prototype. Sites that need a different fallback (e.g. _isClobbered
+     returns early on a null name) intentionally keep their own reads. */
+  const _readNodeType = function (node: Node): number {
+    return getNodeType ? getNodeType(node) : (node as any).nodeType;
+  };
+
+  const _readNodeName = function (node: Node): string {
+    return getNodeName ? getNodeName(node) : (node as any).nodeName;
+  };
+
+  /* Element namespace through the cached Element.prototype getter, so a live
+     node's own-property override (Object.defineProperty) cannot steer
+     namespace decisions; direct read where the getter does not exist. Only
+     call this on Elements - the getter throws on other node types. */
+  const getNamespaceURI = lookupAccessor(ElementPrototype, 'namespaceURI');
+  const _readNamespaceURI = function (element: Element): string | null {
+    return getNamespaceURI
+      ? getNamespaceURI(element)
+      : (element as any).namespaceURI;
+  };
 
   // As per issue #47, the web-components registry is inherited by a
   // new document created via createHTMLDocument. As per the spec
@@ -176,6 +321,71 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
 
   let trustedTypesPolicy;
   let emptyHTML = '';
+
+  // The instance's own internal Trusted Types policy. Unlike a caller-supplied
+  // `TRUSTED_TYPES_POLICY`, this is created at most once — Trusted Types throws
+  // on duplicate policy names — and is the only policy allowed to persist
+  // across configurations and survive `clearConfig()`.
+  let defaultTrustedTypesPolicy;
+  let defaultTrustedTypesPolicyResolved = false;
+
+  // Tracks whether we are already inside a call to the configured Trusted Types
+  // policy (`createHTML` or `createScriptURL`). If a supplied policy callback
+  // itself calls `DOMPurify.sanitize` (the cause of #1422), `sanitize` would
+  // re-enter the policy and recurse until the stack overflows. We detect that
+  // re-entry and throw a clear, actionable error instead. The guard is shared
+  // across both callbacks, because either one re-entering `sanitize` triggers
+  // the same unbounded recursion.
+  let IN_TRUSTED_TYPES_POLICY = 0;
+  const _assertNotInTrustedTypesPolicy = function (): void {
+    if (IN_TRUSTED_TYPES_POLICY > 0) {
+      throw typeErrorCreate(
+        'A configured TRUSTED_TYPES_POLICY callback (createHTML or ' +
+          'createScriptURL) must not call DOMPurify.sanitize, as that causes ' +
+          'infinite recursion. Do not pass a policy whose callbacks wrap ' +
+          'DOMPurify as TRUSTED_TYPES_POLICY; see the "DOMPurify and Trusted ' +
+          'Types" section of the README.'
+      );
+    }
+  };
+
+  const _createTrustedHTML = function (html: string): string {
+    _assertNotInTrustedTypesPolicy();
+
+    IN_TRUSTED_TYPES_POLICY++;
+    try {
+      return trustedTypesPolicy.createHTML(html);
+    } finally {
+      IN_TRUSTED_TYPES_POLICY--;
+    }
+  };
+
+  const _createTrustedScriptURL = function (scriptUrl: string): string {
+    _assertNotInTrustedTypesPolicy();
+
+    IN_TRUSTED_TYPES_POLICY++;
+    try {
+      return trustedTypesPolicy.createScriptURL(scriptUrl);
+    } finally {
+      IN_TRUSTED_TYPES_POLICY--;
+    }
+  };
+
+  // Lazily resolve (and cache) the instance's internal default policy.
+  // Resolution is attempted at most once: a successful `createPolicy` cannot be
+  // repeated (Trusted Types throws on duplicate names), and a failed or
+  // unsupported attempt must not be retried on every parse.
+  const _getDefaultTrustedTypesPolicy = function () {
+    if (!defaultTrustedTypesPolicyResolved) {
+      defaultTrustedTypesPolicy = _createTrustedTypesPolicy(
+        trustedTypes,
+        currentScript
+      );
+      defaultTrustedTypesPolicyResolved = true;
+    }
+
+    return defaultTrustedTypesPolicy;
+  };
 
   const {
     implementation,
@@ -268,6 +478,24 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
   /* Explicitly forbidden attributes (overrides ALLOWED_ATTR/ADD_ATTR) */
   let FORBID_ATTR = null;
 
+  /* Config object to store ADD_TAGS/ADD_ATTR functions (when used as functions) */
+  const EXTRA_ELEMENT_HANDLING = Object.seal(
+    create(null, {
+      tagCheck: {
+        writable: true,
+        configurable: false,
+        enumerable: true,
+        value: null,
+      },
+      attributeCheck: {
+        writable: true,
+        configurable: false,
+        enumerable: true,
+        value: null,
+      },
+    })
+  );
+
   /* Decide if ARIA attributes are okay */
   let ALLOW_ARIA_ATTR = true;
 
@@ -296,6 +524,14 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
 
   /* Track whether config is already set on this instance of DOMPurify. */
   let SET_CONFIG = false;
+
+  /* Pristine allowlist bindings captured at setConfig() time. On the
+   * persistent-config path sanitize() restores the sets from these before
+   * the per-walk hook clone-guard, so a hook's in-call widening cannot
+   * carry across calls. Null until setConfig() is called; reset by
+   * clearConfig(). */
+  let SET_CONFIG_ALLOWED_TAGS = null;
+  let SET_CONFIG_ALLOWED_ATTR = null;
 
   /* Decide if all elements (e.g. style, script) must be children of
    * document.body. By default, browsers might move them to document.head */
@@ -343,6 +579,9 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
    * of importing it into a new Document and returning a sanitized copy */
   let IN_PLACE = false;
 
+  /* IN_PLACE: nodes processed during the current call */
+  let IN_PLACE_VISITED: Set<unknown> | null = null;
+
   /* Allow usage of profiles like html, svg and mathMl */
   let USE_PROFILES: UseProfilesConfig | false = {};
 
@@ -367,6 +606,16 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
     'noscript',
     'plaintext',
     'script',
+    // <selectedcontent> mirrors the selected <option>'s subtree, cloned by
+    // the UA (customizable <select>) — including any on* handlers — and the
+    // engine re-mirrors synchronously whenever a removal changes which
+    // option/selectedcontent is current, even inside DOMPurify's inert
+    // DOMParser document. Hoisting its children on removal re-inserts a fresh
+    // mirror target ahead of the walk, which the engine refills, looping
+    // forever (DoS) and amplifying output. Dropping its content on removal
+    // (rather than hoisting) breaks that cascade; the content is a duplicate
+    // of the option, which is sanitized on its own. See campaign-3 F1/F6.
+    'selectedcontent',
     'style',
     'svg',
     'template',
@@ -421,15 +670,20 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
     stringToString
   );
 
-  let MATHML_TEXT_INTEGRATION_POINTS = addToSet({}, [
+  const DEFAULT_MATHML_TEXT_INTEGRATION_POINTS = freeze([
     'mi',
     'mo',
     'mn',
     'ms',
     'mtext',
   ]);
+  let MATHML_TEXT_INTEGRATION_POINTS = addToSet(
+    {},
+    DEFAULT_MATHML_TEXT_INTEGRATION_POINTS
+  );
 
-  let HTML_INTEGRATION_POINTS = addToSet({}, ['annotation-xml']);
+  const DEFAULT_HTML_INTEGRATION_POINTS = freeze(['annotation-xml']);
+  let HTML_INTEGRATION_POINTS = addToSet({}, DEFAULT_HTML_INTEGRATION_POINTS);
 
   // Certain elements are allowed in both SVG and HTML
   // namespace. We need to specify them explicitly
@@ -495,41 +749,54 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
         : stringToLowerCase;
 
     /* Set configuration parameters */
-    ALLOWED_TAGS = objectHasOwnProperty(cfg, 'ALLOWED_TAGS')
-      ? addToSet({}, cfg.ALLOWED_TAGS, transformCaseFunc)
-      : DEFAULT_ALLOWED_TAGS;
-    ALLOWED_ATTR = objectHasOwnProperty(cfg, 'ALLOWED_ATTR')
-      ? addToSet({}, cfg.ALLOWED_ATTR, transformCaseFunc)
-      : DEFAULT_ALLOWED_ATTR;
-    ALLOWED_NAMESPACES = objectHasOwnProperty(cfg, 'ALLOWED_NAMESPACES')
-      ? addToSet({}, cfg.ALLOWED_NAMESPACES, stringToString)
-      : DEFAULT_ALLOWED_NAMESPACES;
-    URI_SAFE_ATTRIBUTES = objectHasOwnProperty(cfg, 'ADD_URI_SAFE_ATTR')
-      ? addToSet(
-          clone(DEFAULT_URI_SAFE_ATTRIBUTES),
-          cfg.ADD_URI_SAFE_ATTR,
-          transformCaseFunc
-        )
-      : DEFAULT_URI_SAFE_ATTRIBUTES;
-    DATA_URI_TAGS = objectHasOwnProperty(cfg, 'ADD_DATA_URI_TAGS')
-      ? addToSet(
-          clone(DEFAULT_DATA_URI_TAGS),
-          cfg.ADD_DATA_URI_TAGS,
-          transformCaseFunc
-        )
-      : DEFAULT_DATA_URI_TAGS;
-    FORBID_CONTENTS = objectHasOwnProperty(cfg, 'FORBID_CONTENTS')
-      ? addToSet({}, cfg.FORBID_CONTENTS, transformCaseFunc)
-      : DEFAULT_FORBID_CONTENTS;
-    FORBID_TAGS = objectHasOwnProperty(cfg, 'FORBID_TAGS')
-      ? addToSet({}, cfg.FORBID_TAGS, transformCaseFunc)
-      : clone({});
-    FORBID_ATTR = objectHasOwnProperty(cfg, 'FORBID_ATTR')
-      ? addToSet({}, cfg.FORBID_ATTR, transformCaseFunc)
-      : clone({});
+    ALLOWED_TAGS = _resolveSetOption(
+      cfg,
+      'ALLOWED_TAGS',
+      DEFAULT_ALLOWED_TAGS,
+      { transform: transformCaseFunc }
+    );
+    ALLOWED_ATTR = _resolveSetOption(
+      cfg,
+      'ALLOWED_ATTR',
+      DEFAULT_ALLOWED_ATTR,
+      { transform: transformCaseFunc }
+    );
+    ALLOWED_NAMESPACES = _resolveSetOption(
+      cfg,
+      'ALLOWED_NAMESPACES',
+      DEFAULT_ALLOWED_NAMESPACES,
+      { transform: stringToString }
+    );
+    URI_SAFE_ATTRIBUTES = _resolveSetOption(
+      cfg,
+      'ADD_URI_SAFE_ATTR',
+      DEFAULT_URI_SAFE_ATTRIBUTES,
+      { transform: transformCaseFunc, base: DEFAULT_URI_SAFE_ATTRIBUTES }
+    );
+    DATA_URI_TAGS = _resolveSetOption(
+      cfg,
+      'ADD_DATA_URI_TAGS',
+      DEFAULT_DATA_URI_TAGS,
+      { transform: transformCaseFunc, base: DEFAULT_DATA_URI_TAGS }
+    );
+    FORBID_CONTENTS = _resolveSetOption(
+      cfg,
+      'FORBID_CONTENTS',
+      DEFAULT_FORBID_CONTENTS,
+      { transform: transformCaseFunc }
+    );
+    FORBID_TAGS = _resolveSetOption(cfg, 'FORBID_TAGS', clone({}), {
+      transform: transformCaseFunc,
+    });
+    FORBID_ATTR = _resolveSetOption(cfg, 'FORBID_ATTR', clone({}), {
+      transform: transformCaseFunc,
+    });
     USE_PROFILES = objectHasOwnProperty(cfg, 'USE_PROFILES')
-      ? cfg.USE_PROFILES
+      ? cfg.USE_PROFILES && typeof cfg.USE_PROFILES === 'object'
+        ? clone(cfg.USE_PROFILES)
+        : cfg.USE_PROFILES
       : false;
+
     ALLOW_ARIA_ATTR = cfg.ALLOW_ARIA_ATTR !== false; // Default true
     ALLOW_DATA_ATTR = cfg.ALLOW_DATA_ATTR !== false; // Default true
     ALLOW_UNKNOWN_PROTOCOLS = cfg.ALLOW_UNKNOWN_PROTOCOLS || false; // Default false
@@ -545,38 +812,60 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
     SANITIZE_NAMED_PROPS = cfg.SANITIZE_NAMED_PROPS || false; // Default false
     KEEP_CONTENT = cfg.KEEP_CONTENT !== false; // Default true
     IN_PLACE = cfg.IN_PLACE || false; // Default false
-    IS_ALLOWED_URI = cfg.ALLOWED_URI_REGEXP || EXPRESSIONS.IS_ALLOWED_URI;
-    NAMESPACE = cfg.NAMESPACE || HTML_NAMESPACE;
-    MATHML_TEXT_INTEGRATION_POINTS =
-      cfg.MATHML_TEXT_INTEGRATION_POINTS || MATHML_TEXT_INTEGRATION_POINTS;
-    HTML_INTEGRATION_POINTS =
-      cfg.HTML_INTEGRATION_POINTS || HTML_INTEGRATION_POINTS;
+    IS_ALLOWED_URI = isRegex(cfg.ALLOWED_URI_REGEXP)
+      ? cfg.ALLOWED_URI_REGEXP
+      : EXPRESSIONS.IS_ALLOWED_URI; // Default regexp
 
-    CUSTOM_ELEMENT_HANDLING = cfg.CUSTOM_ELEMENT_HANDLING || {};
+    NAMESPACE =
+      typeof cfg.NAMESPACE === 'string' ? cfg.NAMESPACE : HTML_NAMESPACE; // Default HTML namespace
+
+    MATHML_TEXT_INTEGRATION_POINTS = _resolveObjectOption(
+      cfg,
+      'MATHML_TEXT_INTEGRATION_POINTS',
+      () => addToSet({}, DEFAULT_MATHML_TEXT_INTEGRATION_POINTS) // Default built-in map
+    );
+
+    HTML_INTEGRATION_POINTS = _resolveObjectOption(
+      cfg,
+      'HTML_INTEGRATION_POINTS',
+      () => addToSet({}, DEFAULT_HTML_INTEGRATION_POINTS) // Default built-in map
+    );
+
+    const customElementHandling = _resolveObjectOption(
+      cfg,
+      'CUSTOM_ELEMENT_HANDLING',
+      () => create(null)
+    );
+
+    CUSTOM_ELEMENT_HANDLING = create(null);
+
     if (
-      cfg.CUSTOM_ELEMENT_HANDLING &&
-      isRegexOrFunction(cfg.CUSTOM_ELEMENT_HANDLING.tagNameCheck)
+      objectHasOwnProperty(customElementHandling, 'tagNameCheck') &&
+      isRegexOrFunction(customElementHandling.tagNameCheck)
     ) {
-      CUSTOM_ELEMENT_HANDLING.tagNameCheck =
-        cfg.CUSTOM_ELEMENT_HANDLING.tagNameCheck;
+      CUSTOM_ELEMENT_HANDLING.tagNameCheck = customElementHandling.tagNameCheck; // Default undefined
     }
 
     if (
-      cfg.CUSTOM_ELEMENT_HANDLING &&
-      isRegexOrFunction(cfg.CUSTOM_ELEMENT_HANDLING.attributeNameCheck)
+      objectHasOwnProperty(customElementHandling, 'attributeNameCheck') &&
+      isRegexOrFunction(customElementHandling.attributeNameCheck)
     ) {
       CUSTOM_ELEMENT_HANDLING.attributeNameCheck =
-        cfg.CUSTOM_ELEMENT_HANDLING.attributeNameCheck;
+        customElementHandling.attributeNameCheck; // Default undefined
     }
 
     if (
-      cfg.CUSTOM_ELEMENT_HANDLING &&
-      typeof cfg.CUSTOM_ELEMENT_HANDLING.allowCustomizedBuiltInElements ===
-        'boolean'
+      objectHasOwnProperty(
+        customElementHandling,
+        'allowCustomizedBuiltInElements'
+      ) &&
+      typeof customElementHandling.allowCustomizedBuiltInElements === 'boolean'
     ) {
       CUSTOM_ELEMENT_HANDLING.allowCustomizedBuiltInElements =
-        cfg.CUSTOM_ELEMENT_HANDLING.allowCustomizedBuiltInElements;
+        customElementHandling.allowCustomizedBuiltInElements; // Default undefined
     }
+
+    seal(CUSTOM_ELEMENT_HANDLING);
 
     if (SAFE_FOR_TEMPLATES) {
       ALLOW_DATA_ATTR = false;
@@ -589,7 +878,7 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
     /* Parse profile info */
     if (USE_PROFILES) {
       ALLOWED_TAGS = addToSet({}, TAGS.text);
-      ALLOWED_ATTR = [];
+      ALLOWED_ATTR = create(null);
       if (USE_PROFILES.html === true) {
         addToSet(ALLOWED_TAGS, TAGS.html);
         addToSet(ALLOWED_ATTR, ATTRS.html);
@@ -614,33 +903,45 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
       }
     }
 
+    /* Always reset function-based ADD_TAGS / ADD_ATTR checks to prevent
+     * leaking across calls when switching from function to array config */
+    EXTRA_ELEMENT_HANDLING.tagCheck = null;
+    EXTRA_ELEMENT_HANDLING.attributeCheck = null;
+
     /* Merge configuration parameters */
-    if (cfg.ADD_TAGS) {
-      if (ALLOWED_TAGS === DEFAULT_ALLOWED_TAGS) {
-        ALLOWED_TAGS = clone(ALLOWED_TAGS);
+    if (objectHasOwnProperty(cfg, 'ADD_TAGS')) {
+      if (typeof cfg.ADD_TAGS === 'function') {
+        EXTRA_ELEMENT_HANDLING.tagCheck = cfg.ADD_TAGS;
+      } else if (arrayIsArray(cfg.ADD_TAGS)) {
+        if (ALLOWED_TAGS === DEFAULT_ALLOWED_TAGS) {
+          ALLOWED_TAGS = clone(ALLOWED_TAGS);
+        }
+
+        addToSet(ALLOWED_TAGS, cfg.ADD_TAGS, transformCaseFunc);
       }
-
-      addToSet(ALLOWED_TAGS, cfg.ADD_TAGS, transformCaseFunc);
     }
 
-    if (cfg.ADD_ATTR) {
-      if (ALLOWED_ATTR === DEFAULT_ALLOWED_ATTR) {
-        ALLOWED_ATTR = clone(ALLOWED_ATTR);
+    if (objectHasOwnProperty(cfg, 'ADD_ATTR')) {
+      if (typeof cfg.ADD_ATTR === 'function') {
+        EXTRA_ELEMENT_HANDLING.attributeCheck = cfg.ADD_ATTR;
+      } else if (arrayIsArray(cfg.ADD_ATTR)) {
+        if (ALLOWED_ATTR === DEFAULT_ALLOWED_ATTR) {
+          ALLOWED_ATTR = clone(ALLOWED_ATTR);
+        }
+
+        addToSet(ALLOWED_ATTR, cfg.ADD_ATTR, transformCaseFunc);
       }
-
-      addToSet(ALLOWED_ATTR, cfg.ADD_ATTR, transformCaseFunc);
     }
 
-    if (cfg.ADD_URI_SAFE_ATTR) {
-      addToSet(URI_SAFE_ATTRIBUTES, cfg.ADD_URI_SAFE_ATTR, transformCaseFunc);
-    }
-
-    if (cfg.FORBID_CONTENTS) {
+    if (
+      objectHasOwnProperty(cfg, 'ADD_FORBID_CONTENTS') &&
+      arrayIsArray(cfg.ADD_FORBID_CONTENTS)
+    ) {
       if (FORBID_CONTENTS === DEFAULT_FORBID_CONTENTS) {
         FORBID_CONTENTS = clone(FORBID_CONTENTS);
       }
 
-      addToSet(FORBID_CONTENTS, cfg.FORBID_CONTENTS, transformCaseFunc);
+      addToSet(FORBID_CONTENTS, cfg.ADD_FORBID_CONTENTS, transformCaseFunc);
     }
 
     /* Add #text in case KEEP_CONTENT is set to true */
@@ -659,6 +960,13 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
       delete FORBID_TAGS.tbody;
     }
 
+    // Re-derive the active Trusted Types policy from this configuration on
+    // every parse. The active policy must never be sticky closure state that
+    // outlives the config that set it: a caller-supplied policy left in place
+    // after `clearConfig()` — or after a later call that supplied none, or
+    // `TRUSTED_TYPES_POLICY: null` — could sign a subsequent "default"
+    // `RETURN_TRUSTED_TYPE` result with a foreign, possibly unsafe policy.
+    // See GHSA-vxr8-fq34-vvx9.
     if (cfg.TRUSTED_TYPES_POLICY) {
       if (typeof cfg.TRUSTED_TYPES_POLICY.createHTML !== 'function') {
         throw typeErrorCreate(
@@ -672,23 +980,47 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
         );
       }
 
-      // Overwrite existing TrustedTypes policy.
+      // A caller-supplied policy applies to this configuration only.
+      const previousTrustedTypesPolicy = trustedTypesPolicy;
       trustedTypesPolicy = cfg.TRUSTED_TYPES_POLICY;
 
-      // Sign local variables required by `sanitize`.
-      emptyHTML = trustedTypesPolicy.createHTML('');
+      // Sign local variables required by `sanitize`. If the supplied policy's
+      // `createHTML` is circular (i.e. it calls `DOMPurify.sanitize`), this
+      // throws via the re-entrancy guard. Restore the previous policy first so
+      // the instance is not left in a poisoned state. See #1422.
+      try {
+        emptyHTML = _createTrustedHTML('');
+      } catch (error) {
+        trustedTypesPolicy = previousTrustedTypesPolicy;
+        throw error;
+      }
+    } else if (cfg.TRUSTED_TYPES_POLICY === null) {
+      // Explicit opt-out for this call: perform no Trusted Types signing and
+      // create nothing (so a strict `trusted-types` CSP that disallows a
+      // `dompurify` policy can still call `sanitize` from inside its own
+      // policy — see #1422). Resetting to `undefined` rather than a sticky
+      // `null` also drops any previously retained caller policy, so it cannot
+      // resurface on a later call, while still allowing the next config-less
+      // call to restore the internal default policy. See GHSA-vxr8-fq34-vvx9.
+      trustedTypesPolicy = undefined;
+      emptyHTML = '';
     } else {
-      // Uninitialized policy, attempt to initialize the internal dompurify policy.
+      // No policy supplied: keep the currently active policy if one is set — a
+      // previously supplied policy is intentionally sticky across config-less
+      // calls — otherwise fall back to the instance's own internal policy,
+      // created at most once. (A policy supplied for a *single* call still
+      // lingers by design; what must not linger is a policy whose configuration
+      // has been torn down via `clearConfig()`, which restores the default.)
       if (trustedTypesPolicy === undefined) {
-        trustedTypesPolicy = _createTrustedTypesPolicy(
-          trustedTypes,
-          currentScript
-        );
+        trustedTypesPolicy = _getDefaultTrustedTypesPolicy();
       }
 
-      // If creating the internal policy succeeded sign internal variables.
-      if (trustedTypesPolicy !== null && typeof emptyHTML === 'string') {
-        emptyHTML = trustedTypesPolicy.createHTML('');
+      // Sign internal variables only when a policy is active. A falsy policy
+      // (Trusted Types unsupported, creation failed, or an explicit opt-out)
+      // leaves `emptyHTML` as a plain string, so we never call `.createHTML` on
+      // a non-policy and throw. See #1422.
+      if (trustedTypesPolicy && typeof emptyHTML === 'string') {
+        emptyHTML = _createTrustedHTML('');
       }
     }
 
@@ -715,103 +1047,161 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
   ]);
 
   /**
+   * Namespace rules for an element in the SVG namespace.
+   *
+   * @param tagName the element's lowercase tag name
+   * @param parent the (possibly simulated) parent node
+   * @param parentTagName the parent's lowercase tag name
+   * @returns true if a spec-compliant parser could produce this element
+   */
+  const _checkSvgNamespace = function (
+    tagName: string,
+    parent: { namespaceURI?: string },
+    parentTagName: string
+  ): boolean {
+    // The only way to switch from HTML namespace to SVG
+    // is via <svg>. If it happens via any other tag, then
+    // it should be killed.
+    if (parent.namespaceURI === HTML_NAMESPACE) {
+      return tagName === 'svg';
+    }
+
+    // The only way to switch from MathML to SVG is via <svg>
+    // if the parent is either <annotation-xml> or a MathML
+    // text integration point.
+    if (parent.namespaceURI === MATHML_NAMESPACE) {
+      return (
+        tagName === 'svg' &&
+        (parentTagName === 'annotation-xml' ||
+          MATHML_TEXT_INTEGRATION_POINTS[parentTagName])
+      );
+    }
+
+    // We only allow elements that are defined in SVG
+    // spec. All others are disallowed in SVG namespace.
+    return Boolean(ALL_SVG_TAGS[tagName]);
+  };
+
+  /**
+   * Namespace rules for an element in the MathML namespace.
+   *
+   * @param tagName the element's lowercase tag name
+   * @param parent the (possibly simulated) parent node
+   * @param parentTagName the parent's lowercase tag name
+   * @returns true if a spec-compliant parser could produce this element
+   */
+  const _checkMathMlNamespace = function (
+    tagName: string,
+    parent: { namespaceURI?: string },
+    parentTagName: string
+  ): boolean {
+    // The only way to switch from HTML namespace to MathML
+    // is via <math>. If it happens via any other tag, then
+    // it should be killed.
+    if (parent.namespaceURI === HTML_NAMESPACE) {
+      return tagName === 'math';
+    }
+
+    // The only way to switch from SVG to MathML is via
+    // <math> and HTML integration points
+    if (parent.namespaceURI === SVG_NAMESPACE) {
+      return tagName === 'math' && HTML_INTEGRATION_POINTS[parentTagName];
+    }
+
+    // We only allow elements that are defined in MathML
+    // spec. All others are disallowed in MathML namespace.
+    return Boolean(ALL_MATHML_TAGS[tagName]);
+  };
+
+  /**
+   * Namespace rules for an element in the HTML namespace.
+   *
+   * @param tagName the element's lowercase tag name
+   * @param parent the (possibly simulated) parent node
+   * @param parentTagName the parent's lowercase tag name
+   * @returns true if a spec-compliant parser could produce this element
+   */
+  const _checkHtmlNamespace = function (
+    tagName: string,
+    parent: { namespaceURI?: string },
+    parentTagName: string
+  ): boolean {
+    // The only way to switch from SVG to HTML is via
+    // HTML integration points, and from MathML to HTML
+    // is via MathML text integration points
+    if (
+      parent.namespaceURI === SVG_NAMESPACE &&
+      !HTML_INTEGRATION_POINTS[parentTagName]
+    ) {
+      return false;
+    }
+
+    if (
+      parent.namespaceURI === MATHML_NAMESPACE &&
+      !MATHML_TEXT_INTEGRATION_POINTS[parentTagName]
+    ) {
+      return false;
+    }
+
+    // We disallow tags that are specific for MathML
+    // or SVG and should never appear in HTML namespace
+    return (
+      !ALL_MATHML_TAGS[tagName] &&
+      (COMMON_SVG_AND_HTML_ELEMENTS[tagName] || !ALL_SVG_TAGS[tagName])
+    );
+  };
+
+  /**
    * @param element a DOM element whose namespace is being checked
    * @returns Return false if the element has a
    *  namespace that a spec-compliant parser would never
    *  return. Return true otherwise.
    */
   const _checkValidNamespace = function (element: Element): boolean {
-    let parent = getParentNode(element);
+    /* Read names and namespaces through the cached prototype getters, never
+       the instance properties. A live IN_PLACE node can carry own-property
+       overrides of tagName / namespaceURI (Object.defineProperty) that would
+       otherwise steer the classification below: a namespace-confused node
+       posing as a plain HTML element, or a parent posing as an integration
+       point. Same root cause as GHSA-x4vx-rjvf-j5p4 (nodeName); for elements
+       nodeName is the tagName. */
+    const elementNamespace = _readNamespaceURI(element);
+    const tagName = stringToLowerCase(_readNodeName(element));
 
-    // In JSDOM, if we're inside shadow DOM, then parentNode
-    // can be null. We just simulate parent in this case.
-    if (!parent || !parent.tagName) {
-      parent = {
-        namespaceURI: NAMESPACE,
-        tagName: 'template',
-      };
+    // A missing parent (JSDOM inside shadow DOM) or a non-element parent
+    // (DocumentFragment, ShadowRoot, Document) is simulated as a <template>
+    // in the configured namespace, as before.
+    const parentNode = getParentNode(element);
+    let parent: { namespaceURI: string | null };
+    let parentTagName: string;
+    if (parentNode && _readNodeType(parentNode) === NODE_TYPE.element) {
+      parent = { namespaceURI: _readNamespaceURI(parentNode) };
+      parentTagName = stringToLowerCase(_readNodeName(parentNode));
+    } else {
+      parent = { namespaceURI: NAMESPACE };
+      parentTagName = 'template';
     }
 
-    const tagName = stringToLowerCase(element.tagName);
-    const parentTagName = stringToLowerCase(parent.tagName);
-
-    if (!ALLOWED_NAMESPACES[element.namespaceURI]) {
+    if (!ALLOWED_NAMESPACES[elementNamespace]) {
       return false;
     }
 
-    if (element.namespaceURI === SVG_NAMESPACE) {
-      // The only way to switch from HTML namespace to SVG
-      // is via <svg>. If it happens via any other tag, then
-      // it should be killed.
-      if (parent.namespaceURI === HTML_NAMESPACE) {
-        return tagName === 'svg';
-      }
-
-      // The only way to switch from MathML to SVG is via`
-      // svg if parent is either <annotation-xml> or MathML
-      // text integration points.
-      if (parent.namespaceURI === MATHML_NAMESPACE) {
-        return (
-          tagName === 'svg' &&
-          (parentTagName === 'annotation-xml' ||
-            MATHML_TEXT_INTEGRATION_POINTS[parentTagName])
-        );
-      }
-
-      // We only allow elements that are defined in SVG
-      // spec. All others are disallowed in SVG namespace.
-      return Boolean(ALL_SVG_TAGS[tagName]);
+    if (elementNamespace === SVG_NAMESPACE) {
+      return _checkSvgNamespace(tagName, parent, parentTagName);
     }
 
-    if (element.namespaceURI === MATHML_NAMESPACE) {
-      // The only way to switch from HTML namespace to MathML
-      // is via <math>. If it happens via any other tag, then
-      // it should be killed.
-      if (parent.namespaceURI === HTML_NAMESPACE) {
-        return tagName === 'math';
-      }
-
-      // The only way to switch from SVG to MathML is via
-      // <math> and HTML integration points
-      if (parent.namespaceURI === SVG_NAMESPACE) {
-        return tagName === 'math' && HTML_INTEGRATION_POINTS[parentTagName];
-      }
-
-      // We only allow elements that are defined in MathML
-      // spec. All others are disallowed in MathML namespace.
-      return Boolean(ALL_MATHML_TAGS[tagName]);
+    if (elementNamespace === MATHML_NAMESPACE) {
+      return _checkMathMlNamespace(tagName, parent, parentTagName);
     }
 
-    if (element.namespaceURI === HTML_NAMESPACE) {
-      // The only way to switch from SVG to HTML is via
-      // HTML integration points, and from MathML to HTML
-      // is via MathML text integration points
-      if (
-        parent.namespaceURI === SVG_NAMESPACE &&
-        !HTML_INTEGRATION_POINTS[parentTagName]
-      ) {
-        return false;
-      }
-
-      if (
-        parent.namespaceURI === MATHML_NAMESPACE &&
-        !MATHML_TEXT_INTEGRATION_POINTS[parentTagName]
-      ) {
-        return false;
-      }
-
-      // We disallow tags that are specific for MathML
-      // or SVG and should never appear in HTML namespace
-      return (
-        !ALL_MATHML_TAGS[tagName] &&
-        (COMMON_SVG_AND_HTML_ELEMENTS[tagName] || !ALL_SVG_TAGS[tagName])
-      );
+    if (elementNamespace === HTML_NAMESPACE) {
+      return _checkHtmlNamespace(tagName, parent, parentTagName);
     }
 
     // For XHTML and XML documents that support custom namespaces
     if (
       PARSER_MEDIA_TYPE === 'application/xhtml+xml' &&
-      ALLOWED_NAMESPACES[element.namespaceURI]
+      ALLOWED_NAMESPACES[elementNamespace]
     ) {
       return true;
     }
@@ -835,30 +1225,141 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
       // eslint-disable-next-line unicorn/prefer-dom-node-remove
       getParentNode(node).removeChild(node);
     } catch (_) {
+      /* The normal detach failed — this is reached for a parentless node
+         (getParentNode() is null, so .removeChild throws). Element.prototype
+         .remove() is itself a spec no-op on a parentless node, so a recorded
+         "removal" would otherwise hand the caller back an intact,
+         payload-bearing node (e.g. a detached IN_PLACE root the mXSS canary or
+         the style-with-element-child rule decided to kill). Fail closed by
+         throwing — exactly as a clobbered root does at the IN_PLACE entry —
+         rather than trying to "neutralize" the node via its own methods.
+         Neutralizing would mean calling getAttributeNames()/removeAttribute()
+         on the node, both of which a <form> root can clobber via a named child
+         (and _isClobbered does not even probe getAttributeNames), so the
+         neutralize step could itself be silently defeated, leaving the payload
+         intact. A throw touches only the cached, clobber-safe remove() and
+         getParentNode(). Generalizes GHSA-r47g-fvhr-h676 (clobbered-form root)
+         to every root-kill reason. REPORT-3.
+
+         This lives inside the catch, so it never fires for a normally-removed
+         in-tree node: those have a parent, removeChild() succeeds, and the
+         catch is not entered. Only a kept (parentless) root reaches here. */
       remove(node);
+
+      if (!getParentNode(node)) {
+        throw typeErrorCreate(
+          'a node selected for removal could not be detached from its tree ' +
+            'and cannot be safely returned; refusing to sanitize in place'
+        );
+      }
     }
   };
 
   /**
-   * _removeAttribute
+   * _stripAttributeNode
    *
-   * @param name an Attribute name
-   * @param element a DOM node
+   * Remove a single Attr node case/namespace-exactly on an attribute-teardown
+   * path. Name-based removeAttribute() ASCII-lowercases its lookup key for an
+   * HTML element in an HTML document and so silently misses a case-preserved
+   * handler (e.g. `ONERROR` off an XML/XHTML import) - the same defect
+   * _removeAttribute() was fixed for, which a name-based call would reintroduce
+   * on these IN_PLACE teardown paths. Unlike _removeAttribute this does not
+   * record into DOMPurify.removed: the neutralize passes intentionally do not
+   * book-keep. A clobbered/detached node falls back to best-effort name-based
+   * removal.
+   *
+   * @param element the element to strip the attribute from
+   * @param attribute the Attr node to remove
+   * @param name the attribute's name, for the fallback path
    */
-  const _removeAttribute = function (name: string, element: Element): void {
+  const _stripAttributeNode = function (
+    element: Element,
+    attribute: Attr,
+    name: string
+  ): void {
     try {
-      arrayPush(DOMPurify.removed, {
-        attribute: element.getAttributeNode(name),
-        from: element,
-      });
+      removeAttributeNode(element, attribute);
     } catch (_) {
-      arrayPush(DOMPurify.removed, {
-        attribute: null,
-        from: element,
+      try {
+        element.removeAttribute(name);
+      } catch (_) {}
+    }
+  };
+
+  /**
+   * Fail-closed teardown of an in-place root: strip every disallowed attribute
+   * in the subtree first, so nothing armed is left behind, then remove all
+   * children and the root's own attributes.
+   *
+   * @param root the in-place root to empty
+   */
+  const _neutralizeRoot = function (root: Node): void {
+    _neutralizeSubtree(root);
+
+    const childNodes = getChildNodes(root);
+    if (childNodes) {
+      arrayForEach(arraySlice(childNodes), (child: Node) => {
+        try {
+          remove(child);
+        } catch (_) {
+          /* Best effort */
+        }
       });
     }
 
-    element.removeAttribute(name);
+    // Only elements have attributes; the root may be a rejected fragment
+    const attributes =
+      _readNodeType(root) === NODE_TYPE.element ? getAttributes(root) : null;
+    if (attributes) {
+      for (let i = attributes.length - 1; i >= 0; --i) {
+        const attribute = attributes[i];
+        const name = attribute && attribute.name;
+        if (typeof name === 'string') {
+          _stripAttributeNode(root as Element, attribute, name);
+        }
+      }
+    }
+  };
+
+  /**
+   * Removes an attribute, preferably as its exact Attr node: name-based
+   * removal lowercases the name in HTML documents and misses case-preserved
+   * names, e.g. from imported XHTML.
+   *
+   * @param name an Attribute name
+   * @param element a DOM node
+   * @param attr the exact Attr node to remove, when the caller has it
+   */
+  const _removeAttribute = function (
+    name: string,
+    element: Element,
+    attr?: Attr | null
+  ): void {
+    if (!attr) {
+      try {
+        attr = element.getAttributeNode(name);
+      } catch (_) {
+        attr = null;
+      }
+    }
+
+    arrayPush(DOMPurify.removed, {
+      attribute: attr || null,
+      from: element,
+    });
+
+    try {
+      if (attr) {
+        removeAttributeNode(element, attr);
+      } else {
+        element.removeAttribute(name);
+      }
+    } catch (_) {
+      /* Clobbered or detached node: fall back to name-based removal */
+      try {
+        element.removeAttribute(name);
+      } catch (_) {}
+    }
 
     // We void attribute values for unremovable "is" attributes
     if (name === 'is') {
@@ -872,6 +1373,333 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
         } catch (_) {}
       }
     }
+  };
+
+  /**
+   * Removes every attribute the configuration does not allow. Used to
+   * neutralize nodes discarded from an in-place tree.
+   *
+   * @param element the element to strip
+   */
+  const _stripDisallowedAttributes = function (element: Element): void {
+    const attributes = getAttributes(element);
+    if (!attributes) {
+      return;
+    }
+
+    for (let i = attributes.length - 1; i >= 0; --i) {
+      const attribute = attributes[i];
+      const name = attribute && attribute.name;
+      if (typeof name !== 'string' || ALLOWED_ATTR[transformCaseFunc(name)]) {
+        continue;
+      }
+
+      _stripAttributeNode(element, attribute, name);
+    }
+  };
+
+  /**
+   * Iterative depth-first walk, so deep trees cannot overflow the call stack,
+   * reading through the cached getters, so clobbering cannot hide children.
+   * When `visit` returns false, the node's children are skipped. With
+   * `intoShadow`, open shadow roots are walked after their host's children.
+   *
+   * @param root where to start
+   * @param visit called for every node
+   * @param intoShadow whether to enter open shadow roots
+   */
+  const _walkTree = function (
+    root: Node,
+    visit: (node: Node) => boolean | void,
+    intoShadow = false
+  ): void {
+    const stack: Node[] = [root];
+
+    while (stack.length > 0) {
+      const node = stack.pop();
+      if (visit(node) === false) {
+        continue;
+      }
+
+      if (intoShadow && _readNodeType(node) === NODE_TYPE.element) {
+        const shadowRoot = getShadowRoot(node);
+        if (_isDocumentFragment(shadowRoot)) {
+          stack.push(shadowRoot);
+        }
+      }
+
+      const childNodes = getChildNodes(node);
+      if (childNodes) {
+        for (let i = childNodes.length - 1; i >= 0; --i) {
+          stack.push(childNodes[i]);
+        }
+      }
+    }
+  };
+
+  /**
+   * Strips disallowed attributes from every element of a discarded subtree,
+   * so a handler that is already queued (a loading image) cannot fire.
+   *
+   * @param root the root of a removed subtree
+   */
+  const _neutralizeSubtree = function (root: Node): void {
+    _walkTree(root, (node) => {
+      if (_readNodeType(node) === NODE_TYPE.element) {
+        _stripDisallowedAttributes(node as Element);
+      }
+    });
+  };
+
+  /**
+   * All nodes under `root`, root first, including open shadow roots. Template
+   * content is not entered, it is inert.
+   *
+   * @param root the in-place root
+   * @return the nodes
+   */
+  const _collectLiveNodes = function (root: Node): Node[] {
+    const nodes: Node[] = [];
+    _walkTree(
+      root,
+      (node) => {
+        nodes.push(node);
+      },
+      true
+    );
+    return nodes;
+  };
+
+  /**
+   * Strips disallowed attributes from every element that was under the
+   * in-place root when the call started and no longer is, whatever removed
+   * or moved it.
+   *
+   * @param root the in-place root
+   * @param before the root's nodes, collected before the walk
+   */
+  const _neutralizeEscapedElements = function (
+    root: Node,
+    before: Node[]
+  ): void {
+    const reachable = setCreate();
+    arrayForEach(_collectLiveNodes(root), (node: Node) => {
+      if (_readNodeType(node) === NODE_TYPE.element) {
+        setAdd(reachable, node);
+      }
+    });
+    arrayForEach(before, (node: Node) => {
+      if (
+        _readNodeType(node) === NODE_TYPE.element &&
+        !setHas(reachable, node)
+      ) {
+        _stripDisallowedAttributes(node as Element);
+      }
+    });
+  };
+
+  /**
+   * Neutralizes everything that left the in-place tree during the call: what
+   * DOMPurify removed, and what hooks or custom elements removed or moved out.
+   *
+   * @param root the in-place root
+   * @param before the root's nodes, collected before the walk
+   * @return true if the root itself was removed
+   */
+  const _neutralizeDiscarded = function (root: Node, before: Node[]): boolean {
+    let rootRemoved = false;
+    arrayForEach(DOMPurify.removed, (entry) => {
+      if (entry.element) {
+        rootRemoved = rootRemoved || entry.element === root;
+        _neutralizeSubtree(entry.element as Node);
+      }
+    });
+    _neutralizeEscapedElements(root, before);
+    return rootRemoved;
+  };
+
+  const MAX_UNVISITED_ROUNDS = 8;
+
+  /**
+   * The walk only moves forward, so a node moved to a position it already
+   * passed is never visited. Give every original node that is still in the
+   * tree but unvisited the normal treatment, hooks included. Nodes created
+   * during the call are left alone. Fails closed if the tree keeps changing.
+   *
+   * @param root the in-place root
+   * @param before the root's nodes, collected before the walk
+   */
+  const _sanitizeUnvisitedNodes = function (root: Node, before: Node[]): void {
+    const visited = IN_PLACE_VISITED;
+    /* Built lazily: usually every live node was visited */
+    let original: Set<unknown> | null = null;
+    const getOriginal = (): Set<unknown> => {
+      if (!original) {
+        original = setCreate();
+        arrayForEach(before, (beforeNode: Node) => {
+          setAdd(original, beforeNode);
+        });
+      }
+
+      return original;
+    };
+
+    for (let round = 0; ; round++) {
+      const live = _collectLiveNodes(root);
+      const containers: Node[] = [root];
+      let pending = false;
+
+      arrayForEach(live, (node: Node) => {
+        if (_readNodeType(node) === NODE_TYPE.documentFragment) {
+          /* An open shadow root under the root */
+          arrayPush(containers, node);
+        } else if (!pending && !setHas(visited, node)) {
+          pending = setHas(getOriginal(), node);
+        }
+      });
+
+      if (!pending) {
+        return;
+      }
+
+      if (round >= MAX_UNVISITED_ROUNDS) {
+        throw typeErrorCreate(
+          'the tree kept changing during in-place sanitization; ' +
+            'refusing to return it'
+        );
+      }
+
+      arrayForEach(containers, (container: Node, index: number) => {
+        _sanitizeUnvisitedIn(container, index > 0, root, getOriginal());
+      });
+    }
+  };
+
+  /**
+   * One _sanitizeUnvisitedNodes pass over the root or an open shadow root.
+   *
+   * @param container the root or an open shadow root
+   * @param inShadow whether container is a shadow root
+   * @param root the in-place root
+   * @param original the root's nodes collected before the walk, as a set
+   */
+  const _sanitizeUnvisitedIn = function (
+    container: Node,
+    inShadow: boolean,
+    root: Node,
+    original: Set<unknown>
+  ): void {
+    const iterator = _createNodeIterator(container);
+    let node: Node | null;
+    while ((node = iterator.nextNode())) {
+      if (!setHas(original, node) || setHas(IN_PLACE_VISITED, node)) {
+        continue;
+      }
+
+      if (inShadow) {
+        _executeHooks(hooks.uponSanitizeShadowNode, node, null);
+      }
+
+      _sanitizeElements(node, root);
+      _sanitizeAttributes(node as Element, root);
+      if (_isDocumentFragment((node as HTMLTemplateElement).content)) {
+        _sanitizeShadowDOM((node as HTMLTemplateElement).content);
+      }
+    }
+  };
+
+  /**
+   * Records that _sanitizeElements processed `node`. No-op outside IN_PLACE.
+   *
+   * @param node the node being processed
+   */
+  const _markVisited = function (node: Node): void {
+    if (IN_PLACE_VISITED) {
+      setAdd(IN_PLACE_VISITED, node);
+    }
+  };
+
+  /**
+   * Patch-linkage attributes (declarative partial updates): `patchsrc`
+   * always, `for` everywhere except on <label> and <output>. Gated on
+   * SAFE_FOR_XML. Shared by the IN_PLACE pre-pass and _isValidAttribute.
+   *
+   * @param lcName the transformCaseFunc'd attribute name
+   * @param lcTag the transformCaseFunc'd tag name of the carrying element
+   * @return true if the attribute is patch linkage and must be dropped
+   */
+  const _isPatchLinkageAttribute = function (
+    lcName: string,
+    lcTag: string
+  ): boolean {
+    if (!SAFE_FOR_XML) {
+      return false;
+    }
+
+    if (lcName === 'patchsrc') {
+      return true;
+    }
+
+    return lcName === 'for' && lcTag !== 'label' && lcTag !== 'output';
+  };
+
+  /**
+   * IN_PLACE pre-pass: sever all patch linkage before the walk, so no patch
+   * can fire mid-walk into a part of the tree the walker already passed.
+   * Removes range markers (processing instructions, comments with markup)
+   * and strips linkage attributes. It cannot undo a patch that already fired.
+   *
+   * TODO: if the shipped feature can patch through `for` on <label>/<output>,
+   * drop that pair here too (see test/declarative-patch-probe.html).
+   *
+   * @param root the in-place root to sweep
+   */
+  const _neutralizePatchLinkage = function (root: Node): void {
+    if (!SAFE_FOR_XML) {
+      return;
+    }
+
+    _walkTree(root, (node) => {
+      const nodeType = _readNodeType(node);
+
+      // Range markers: processing instructions, comments with markup
+      if (
+        nodeType === NODE_TYPE.processingInstruction ||
+        (nodeType === NODE_TYPE.comment &&
+          regExpTest(EXPRESSIONS.COMMENT_MARKUP_PROBE, (node as any).data))
+      ) {
+        try {
+          remove(node);
+        } catch (_) {
+          /* Best effort */
+        }
+
+        return false;
+      }
+
+      // Linkage attributes
+      if (nodeType === NODE_TYPE.element) {
+        const element = node as Element;
+        const lcTag = transformCaseFunc(_readNodeName(node));
+        try {
+          if (element.hasAttribute && element.hasAttribute('patchsrc')) {
+            element.removeAttribute('patchsrc');
+          }
+
+          if (
+            element.hasAttribute &&
+            element.hasAttribute('for') &&
+            _isPatchLinkageAttribute('for', lcTag)
+          ) {
+            element.removeAttribute('for');
+          }
+        } catch (_) {
+          /* Clobbered methods on a doomed node */
+        }
+      }
+
+      return true;
+    });
   };
 
   /**
@@ -904,9 +1732,7 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
         '</body></html>';
     }
 
-    const dirtyPayload = trustedTypesPolicy
-      ? trustedTypesPolicy.createHTML(dirty)
-      : dirty;
+    const dirtyPayload = trustedTypesPolicy ? _createTrustedHTML(dirty) : dirty;
     /*
      * Use the DOMParser API by default, fallback later if needs be
      * DOMParser not work for svg when has multiple root element.
@@ -956,8 +1782,18 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
    * @return The created NodeIterator
    */
   const _createNodeIterator = function (root: Node): NodeIterator {
+    /* Read ownerDocument through the cached Node.prototype getter, never the
+       direct property. HTMLFormElement has [LegacyOverrideBuiltIns], so a
+       clobbering child (<input name="ownerDocument"> or a form-associated
+       external input) shadows the prototype getter and makes a direct read
+       return that <input>. createNodeIterator.call(<input>, ...) then throws
+       "Illegal invocation", and on the IN_PLACE path that throw lands before
+       the walk's fail-closed barrier - leaving the caller's live tree, with
+       any already-armed handler in it, un-neutralized. The cached getter
+       returns the real Document regardless of the clobber. */
+    const doc = getOwnerDocument ? getOwnerDocument(root) : root.ownerDocument;
     return createNodeIterator.call(
-      root.ownerDocument || root,
+      doc || root,
       root,
       // eslint-disable-next-line no-bitwise
       NodeFilter.SHOW_ELEMENT |
@@ -970,48 +1806,470 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
   };
 
   /**
+   * Replace template expression syntax (mustache, ERB, template
+   * literal) with a space; shared by all SAFE_FOR_TEMPLATES scrub
+   * sites. Order matters: mustache, then ERB, then template literal.
+   *
+   * @param value the string to scrub
+   * @returns the scrubbed string
+   */
+  const _stripTemplateExpressions = function (value: string): string {
+    value = stringReplace(value, MUSTACHE_EXPR, ' ');
+    value = stringReplace(value, ERB_EXPR, ' ');
+    value = stringReplace(value, TMPLIT_EXPR, ' ');
+    return value;
+  };
+
+  /**
+   * Strip template-engine expressions ({{...}}, ${...}, <%...%>) from the
+   * character data of an element subtree. Used as the final safety net for
+   * SAFE_FOR_TEMPLATES on every DOM-returning code path so that expressions
+   * which only form after text-node normalization (e.g. fragments split across
+   * stripped elements) cannot survive into a template-evaluating framework.
+   *
+   * Walks text/comment/CDATA/processing-instruction nodes and mutates `.data`
+   * in place rather than round-tripping through innerHTML. This preserves
+   * descendant node references (important for IN_PLACE callers), avoids a
+   * serialize/reparse cycle, and reads literal character data — which means
+   * `<%...%>` in text content matches the ERB regex against its real bytes
+   * instead of the HTML-entity-escaped form innerHTML would produce.
+   *
+   * Attribute values are not visited here; SAFE_FOR_TEMPLATES handling for
+   * attributes is performed during the per-node `_sanitizeAttributes` pass.
+   *
+   * @param node The root element whose character data should be scrubbed.
+   */
+  const _scrubTemplateExpressions = function (node: Element): void {
+    _scrubOwnCharacterData(node);
+
+    // NodeIterator does not descend into <template>.content per the DOM spec,
+    // so we must explicitly recurse into each template's content fragment,
+    // mirroring the approach used by _sanitizeShadowDOM.
+    const templates = node.querySelectorAll?.('template');
+    if (templates) {
+      arrayForEach(templates, (tmpl: HTMLTemplateElement) => {
+        if (_isDocumentFragment(tmpl.content)) {
+          _scrubTemplateExpressions(tmpl.content as unknown as Element);
+        }
+      });
+    }
+  };
+
+  /**
+   * _scrubOwnCharacterData
+   *
+   * Non-recursive core of _scrubTemplateExpressions: normalize `node` and
+   * strip template expressions from its own character data only. Does not
+   * enter <template>.content or attached shadow roots (NodeIterator never
+   * does). Used by _sanitizeShadowDOM, where every nested template content
+   * and shadow root is already walked - and therefore scrubbed - by its own
+   * recursive _sanitizeShadowDOM call; recursing here as well would rescrub
+   * each nested fragment once per ancestor, which is quadratic in nesting
+   * depth.
+   *
+   * @param node The root whose own character data should be scrubbed.
+   */
+  const _scrubOwnCharacterData = function (node: Element): void {
+    node.normalize();
+    /* Clobber-safe ownerDocument read, same reasoning as _createNodeIterator:
+       under SAFE_FOR_TEMPLATES this runs on the live IN_PLACE root, which may
+       carry a form-named-getter override of ownerDocument. */
+    const doc = getOwnerDocument ? getOwnerDocument(node) : node.ownerDocument;
+    const walker = createNodeIterator.call(
+      doc || node,
+      node,
+      // eslint-disable-next-line no-bitwise
+      NodeFilter.SHOW_TEXT |
+        NodeFilter.SHOW_COMMENT |
+        NodeFilter.SHOW_CDATA_SECTION |
+        NodeFilter.SHOW_PROCESSING_INSTRUCTION,
+      null
+    );
+
+    let currentNode = walker.nextNode() as CharacterData | null;
+    while (currentNode) {
+      currentNode.data = _stripTemplateExpressions(currentNode.data);
+      currentNode = walker.nextNode() as CharacterData | null;
+    }
+  };
+
+  /**
    * _isClobbered
+   *
+   * Detect DOM-clobbering on HTMLFormElement nodes. Form is the only HTML
+   * interface with [LegacyOverrideBuiltIns]; a descendant element with a
+   * `name` attribute matching a prototype property shadows that property
+   * on direct reads. We use this check at the IN_PLACE entry-point and
+   * during attribute sanitization to refuse clobbered forms.
    *
    * @param element element to check for clobbering attacks
    * @return true if clobbered, false if safe
    */
   const _isClobbered = function (element: Element): boolean {
+    // Realm-independent tag-name probe. If we can't determine the tag
+    // name at all, we can't reason about clobbering — return false
+    // (the caller's other defences still apply).
+    const realTagName = getNodeName ? getNodeName(element) : null;
+    if (typeof realTagName !== 'string') {
+      return false;
+    }
+
+    if (transformCaseFunc(realTagName) !== 'form') {
+      return false;
+    }
+
     return (
-      element instanceof HTMLFormElement &&
-      (typeof element.nodeName !== 'string' ||
-        typeof element.textContent !== 'string' ||
-        typeof element.removeChild !== 'function' ||
-        !(element.attributes instanceof NamedNodeMap) ||
-        typeof element.removeAttribute !== 'function' ||
-        typeof element.setAttribute !== 'function' ||
-        typeof element.namespaceURI !== 'string' ||
-        typeof element.insertBefore !== 'function' ||
-        typeof element.hasChildNodes !== 'function')
+      typeof element.nodeName !== 'string' ||
+      typeof element.textContent !== 'string' ||
+      typeof element.removeChild !== 'function' ||
+      // Realm-safe NamedNodeMap detection: equality against the cached
+      // prototype getter. Clobbered .attributes (e.g. <input name="attributes">)
+      // makes the direct read diverge from the cached read; a clean form
+      // (same-realm OR foreign-realm) has both reads pointing at the same
+      // canonical NamedNodeMap.
+      element.attributes !== getAttributes(element) ||
+      typeof element.removeAttribute !== 'function' ||
+      // A form descendant named "removeAttributeNode" or "getAttributeNode"
+      // shadows these Attr-node methods via [LegacyOverrideBuiltIns].
+      // _removeAttribute() / _stripAttributeNode() reach for
+      // element.removeAttributeNode(attr) first; when it is shadowed the call
+      // throws and the name-based fallback element.removeAttribute(name)
+      // ASCII-lowercases its lookup key in an HTML document, silently missing
+      // a case-preserved event-handler attribute (e.g. an ONANIMATIONSTART
+      // that reached the sanitizer through an XML/XHTML parse). Flag the form
+      // so it is removed wholesale, exactly as for the other shadowed methods.
+      typeof element.removeAttributeNode !== 'function' ||
+      typeof element.getAttributeNode !== 'function' ||
+      typeof element.setAttribute !== 'function' ||
+      typeof element.namespaceURI !== 'string' ||
+      typeof element.insertBefore !== 'function' ||
+      typeof element.hasChildNodes !== 'function' ||
+      // NodeType clobbering probe. Cached Node.prototype.nodeType getter
+      // returns the integer 1 for any Element regardless of realm; direct
+      // read on a clobbered form (e.g. <input name="nodeType">) returns
+      // the named child element. Cheap addition — nodeType is read from
+      // an internal slot, no serialization cost — and removes a residual
+      // clobbering surface used by several mXSS / PI / comment branches
+      // in _sanitizeElements that compare currentNode.nodeType directly.
+      element.nodeType !== getNodeType(element) ||
+      // HTMLFormElement has [LegacyOverrideBuiltIns]: a descendant named
+      // "childNodes" shadows the prototype getter. Direct reads of
+      // form.childNodes from a clobbered form return the named child
+      // instead of the real NodeList, so any walk that reads it directly
+      // skips the form's real children. Compare the direct read to the
+      // cached Node.prototype getter — when the form's named-property
+      // getter intercepts the read, the two values differ and we flag
+      // the form. This catches every clobbering child type (input,
+      // select, etc.) regardless of whether the named child happens to
+      // carry a numeric .length, which a typeof-based probe would miss
+      // (e.g. HTMLSelectElement.length is a defined unsigned-long).
+      element.childNodes !== getChildNodes(element)
     );
   };
 
   /**
-   * Checks whether the given object is a DOM node.
+   * Checks whether the given value is a DocumentFragment from any realm.
    *
-   * @param value object to check whether it's a DOM node
-   * @return true is object is a DOM node
+   * The realm-independent replacement reads `nodeType` through the cached
+   * Node.prototype getter and compares to the DOCUMENT_FRAGMENT_NODE
+   * constant (11). nodeType is a numeric value resolved from the node's
+   * internal slot, identical across realms for the same kind of node.
+   *
+   * @param value object to check
+   * @return true if value is a DocumentFragment-shaped node from any realm
    */
-  const _isNode = function (value: unknown): value is Node {
-    return typeof Node === 'function' && value instanceof Node;
+  const _isDocumentFragment = function (value: unknown): boolean {
+    if (!getNodeType || typeof value !== 'object' || value === null) {
+      return false;
+    }
+
+    try {
+      return getNodeType(value as Node) === NODE_TYPE.documentFragment;
+    } catch (_) {
+      return false;
+    }
   };
 
-  function _executeHooks<
-    T extends
-      | NodeHook
-      | ElementHook
-      | DocumentFragmentHook
-      | UponSanitizeElementHook
-      | UponSanitizeAttributeHook
-  >(hooks: T[], currentNode: Parameters<T>[0], data: Parameters<T>[1]): void {
-    arrayForEach(hooks, (hook) => {
+  /**
+   * Checks whether the given object is a DOM node, including nodes that
+   * originate from a different window/realm (e.g. an iframe's
+   * contentDocument). The previous `value instanceof Node` check was
+   * realm-bound: nodes from a different window failed it, causing
+   * sanitize() to silently stringify them and reset IN_PLACE to false,
+   * returning the original node unsanitized. See GHSA-4w3q-35jp-p934.
+   *
+   * @param value object to check whether it's a DOM node
+   * @return true if value is a DOM node from any realm
+   */
+  const _isNode = function (value: unknown): value is Node {
+    if (!getNodeType || typeof value !== 'object' || value === null) {
+      return false;
+    }
+
+    try {
+      return typeof getNodeType(value) === 'number';
+    } catch (_) {
+      return false;
+    }
+  };
+
+  function _executeHooks<T extends HookFunction>(
+    hooks: HookFunction[],
+    currentNode: Parameters<T>[0],
+    data: Parameters<T>[1]
+  ): void {
+    if (hooks.length === 0) {
+      return;
+    }
+
+    arrayForEach(hooks, (hook: T) => {
       hook.call(DOMPurify, currentNode, data, CONFIG);
     });
   }
+
+  /**
+   * Structural-threat checks that condemn a node regardless of the
+   * allowlists: mXSS via namespace confusion, risky CSS construction,
+   * processing instructions, markup-bearing comments. Pure predicate;
+   * the caller removes. Check order is load-bearing.
+   *
+   * @param currentNode the node to inspect
+   * @param tagName the node's transformCaseFunc'd tag name
+   * @return true if the node must be removed
+   */
+  const _isUnsafeNode = function (currentNode: any, tagName: string): boolean {
+    /* Detect mXSS attempts abusing namespace confusion */
+    if (
+      SAFE_FOR_XML &&
+      currentNode.hasChildNodes() &&
+      !_isNode(currentNode.firstElementChild) &&
+      regExpTest(EXPRESSIONS.ELEMENT_MARKUP_PROBE, currentNode.textContent) &&
+      regExpTest(EXPRESSIONS.ELEMENT_MARKUP_PROBE, currentNode.innerHTML)
+    ) {
+      return true;
+    }
+
+    /* Remove rawtext/literal-text elements whose literal serialization
+       re-opens markup on an HTML reparse - shapes (a) and (b) documented at
+       LITERAL_TEXT_ELEMENTS. Both are invisible to rule 1 above (which
+       self-disables once there is an element child, and whose second probe
+       reads the innerHTML an XML/XHTML document serializes escaped), which
+       is why both probes here read textContent instead. Previously only
+       `style`-with-element-child was covered; every element in
+       LITERAL_TEXT_ELEMENTS shares this literal serialization and is
+       equally affected.
+
+       The text probe is rule 1's ELEMENT_MARKUP_PROBE, not just the element's
+       own end tag. For these elements textContent is exactly what an HTML
+       serializer emits, so in an HTML working document this is the same
+       decision rule 1 already makes there (markup-like text is removed). Only
+       matching the own end tag let an XML/XHTML-sourced literal-text element
+       keep markup such as `</style><img onerror>` that the same input loses in
+       HTML mode, and that breaks out once the output is placed in another
+       raw-text context.
+
+       Namespace through the cached getter (see _checkValidNamespace), and only
+       for Elements: a processing instruction's nodeName is its target, which
+       can collide with a name in LITERAL_TEXT_ELEMENTS. */
+    if (
+      SAFE_FOR_XML &&
+      LITERAL_TEXT_ELEMENTS[tagName] &&
+      _readNodeType(currentNode) === NODE_TYPE.element &&
+      _readNamespaceURI(currentNode) === HTML_NAMESPACE &&
+      (_isNode(currentNode.firstElementChild) ||
+        (typeof currentNode.textContent === 'string' &&
+          regExpTest(
+            EXPRESSIONS.ELEMENT_MARKUP_PROBE,
+            currentNode.textContent
+          )))
+    ) {
+      return true;
+    }
+
+    /* Remove any occurrence of processing instructions */
+    if (currentNode.nodeType === NODE_TYPE.processingInstruction) {
+      return true;
+    }
+
+    /* Remove any kind of possibly harmful comments */
+    if (
+      SAFE_FOR_XML &&
+      currentNode.nodeType === NODE_TYPE.comment &&
+      regExpTest(EXPRESSIONS.COMMENT_MARKUP_PROBE, currentNode.data)
+    ) {
+      return true;
+    }
+
+    return false;
+  };
+
+  /**
+   * Evaluate a CUSTOM_ELEMENT_HANDLING check (a RegExp or a predicate
+   * function, per the validation in _parseConfig) against a name.
+   * Additional arguments are forwarded to predicate functions - the
+   * attributeNameCheck predicate receives the tag name as its second
+   * argument. A null/absent check never matches.
+   *
+   * @param check the configured tagNameCheck / attributeNameCheck value
+   * @param name the name to test
+   * @param args extra arguments forwarded to a predicate function
+   * @return true if the check matches the name
+   */
+  const _matchesNameCheck = function (
+    check: unknown,
+    name: string,
+    ...args: unknown[]
+  ): boolean {
+    if (check instanceof RegExp) {
+      return regExpTest(check, name);
+    }
+
+    if (check instanceof Function) {
+      return Boolean(check(name, ...args));
+    }
+
+    return false;
+  };
+
+  /**
+   * Handle a node whose tag is forbidden or not allowlisted: keep
+   * allowed custom elements (false return exits _sanitizeElements
+   * early - the namespace and fallback-tag removal checks are
+   * intentionally skipped for kept custom elements), else hoist
+   * content per KEEP_CONTENT and remove.
+   *
+   * A kept custom element is the ONLY case in which this function
+   * returns false, so the caller uses that return value to run the
+   * afterSanitizeElements hook on the kept element and keep the
+   * element-hook lifecycle consistent with normal allowlisted
+   * elements (GHSA-c2j3-45gr-mqc4).
+   *
+   * @param currentNode the disallowed node
+   * @param tagName the node's transformCaseFunc'd tag name
+   * @return true if the node was removed, false if kept
+   */
+  const _sanitizeDisallowedNode = function (
+    currentNode: any,
+    tagName: string,
+    root: Node
+  ): boolean {
+    /* Check if we have a custom element to handle */
+    if (
+      !FORBID_TAGS[tagName] &&
+      _isBasicCustomElement(tagName) &&
+      _matchesNameCheck(CUSTOM_ELEMENT_HANDLING.tagNameCheck, tagName)
+    ) {
+      return false;
+    }
+
+    /* Keep content except for bad-listed elements.
+         Use the cached prototype getters exclusively — the previous code
+         had `|| currentNode.parentNode` / `|| currentNode.childNodes`
+         fallbacks, but the cached getters always return the canonical
+         value (or null for a real parent-less node), so the fallback
+         path was dead in safe cases and a clobbering surface in unsafe
+         ones. Falsy cached results stay falsy; the `if (childNodes &&
+         parentNode)` check already gates correctly. */
+    if (
+      KEEP_CONTENT &&
+      !FORBID_CONTENTS[tagName] &&
+      /* The default list is lowercase, but in application/xhtml+xml mode
+         tagName keeps its case, so `foreignObject` would miss its
+         `foreignobject` entry and have its content hoisted instead of
+         dropped, unlike in HTML mode. Also consult the lowercased name; this
+         can only drop more content, never keep more. */
+      !FORBID_CONTENTS[stringToLowerCase(tagName)]
+    ) {
+      const parentNode = getParentNode(currentNode);
+      const childNodes = getChildNodes(currentNode);
+
+      if (childNodes && parentNode) {
+        const childCount = childNodes.length;
+
+        /* Hoist by moving each child up one level rather than deep-cloning
+             it. Moving transfers every descendant exactly once, so a chain of
+             nested disallowed elements costs O(n) instead of the O(n^2) that
+             re-cloning the shrinking subtree at each level produced; it also
+             empties the removed original, so `DOMPurify.removed` no longer
+             pins whole subtrees. Moving preserves the in-place guarantee too:
+             an original carrying already-queued resource events (`<img
+             onerror>`, `<video>`/`<audio>` error, lazy/`onload`, …) is
+             relocated and sanitised rather than left detached but still armed.
+
+             The sole case that must clone is removing the walk root itself.
+             The result is serialised from the root's subtree, so a restrictive
+             ALLOWED_TAGS that strips the root (`body` on the string path) must
+             leave the content inside it, which only cloning does. In IN_PLACE
+             the root is pre-validated as an allowed tag and so is never removed
+             here, so that path always takes the move branch.
+
+             `childNodes` is live; a tail-to-head walk keeps `childNodes[i]`
+             valid whether we move (drops the trailing entry) or clone (leaves
+             the list intact). */
+        for (let i = childCount - 1; i >= 0; --i) {
+          const hoisted =
+            currentNode === root
+              ? cloneNode(childNodes[i], true)
+              : childNodes[i];
+          parentNode.insertBefore(hoisted, getNextSibling(currentNode));
+        }
+      }
+    }
+
+    _forceRemove(currentNode);
+    return true;
+  };
+
+  /**
+   * Fork a hook-mutable allowlist off its shared binding the first time a
+   * (possibly lazily-installed) uponSanitize* hook is about to see it, so the
+   * hook cannot widen the per-instance default or the setConfig binding by
+   * reference and leak past the call. Returns the set unchanged once it is
+   * already call-local, so repeated calls across elements are idempotent.
+   *
+   * @param hookList the uponSanitize* hook array for this event
+   * @param set the current ALLOWED_TAGS / ALLOWED_ATTR binding
+   * @param defaultSet the per-instance DEFAULT_ALLOWED_* constant
+   * @param setConfigSet the captured setConfig() binding, or null
+   * @return a call-local clone if a hook is present and set is still shared,
+   *   else set unchanged
+   */
+  const _forkSharedAllowlist = function <T extends Record<string, any>>(
+    hookList: unknown[],
+    set: T,
+    defaultSet: T,
+    setConfigSet: T | null
+  ): T {
+    if (hookList.length === 0) {
+      return set;
+    }
+
+    return set === defaultSet || set === setConfigSet ? clone(set) : set;
+  };
+
+  /**
+   * A hook may have detached the node it was called for. If so, treat it as
+   * removed and stop processing it; the walk root is exempt. On the IN_PLACE
+   * path the detached subtree is neutralized right away.
+   *
+   * @param currentNode the node a hook may have detached
+   * @param root the current walk root
+   * @return true if the node was detached
+   */
+  const _handleHookDetachedNode = function (
+    currentNode: Node,
+    root: Node
+  ): boolean {
+    if (currentNode === root || getParentNode(currentNode) !== null) {
+      return false;
+    }
+
+    if (IN_PLACE) {
+      _neutralizeSubtree(currentNode);
+    }
+
+    return true;
+  };
 
   /**
    * _sanitizeElements
@@ -1022,11 +2280,18 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
    * @param currentNode to check for permission to exist
    * @return true if node was killed, false if left alive
    */
-  const _sanitizeElements = function (currentNode: any): boolean {
-    let content = null;
+  const _sanitizeElements = function (currentNode: any, root: Node): boolean {
+    /* IN_PLACE: remember the node was processed (see _sanitizeUnvisitedNodes). */
+    _markVisited(currentNode);
 
     /* Execute a hook if present */
     _executeHooks(hooks.beforeSanitizeElements, currentNode, null);
+
+    /* A hook may have detached the node - treat it as removed (see
+       _handleHookDetachedNode for the full rationale). */
+    if (_handleHookDetachedNode(currentNode, root)) {
+      return true;
+    }
 
     /* Check if element is clobbered or can clobber */
     if (_isClobbered(currentNode)) {
@@ -1035,7 +2300,19 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
     }
 
     /* Now let's check the element's type and name */
-    const tagName = transformCaseFunc(currentNode.nodeName);
+    const tagName = transformCaseFunc(_readNodeName(currentNode));
+
+    /* Close the pre-walk clone-guard's timing gap: an uponSanitizeElement
+       hook may have been installed after that guard sampled the hook arrays
+       (e.g. lazily from beforeSanitizeElements), leaving ALLOWED_TAGS still
+       aliasing a shared binding that a widening hook would mutate by
+       reference. Fork it before exposing it to the hook. */
+    ALLOWED_TAGS = _forkSharedAllowlist(
+      hooks.uponSanitizeElement,
+      ALLOWED_TAGS,
+      DEFAULT_ALLOWED_TAGS,
+      SET_CONFIG_ALLOWED_TAGS
+    );
 
     /* Execute a hook if present */
     _executeHooks(hooks.uponSanitizeElement, currentNode, {
@@ -1043,75 +2320,63 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
       allowedTags: ALLOWED_TAGS,
     });
 
-    /* Detect mXSS attempts abusing namespace confusion */
-    if (
-      SAFE_FOR_XML &&
-      currentNode.hasChildNodes() &&
-      !_isNode(currentNode.firstElementChild) &&
-      regExpTest(/<[/\w!]/g, currentNode.innerHTML) &&
-      regExpTest(/<[/\w!]/g, currentNode.textContent)
-    ) {
-      _forceRemove(currentNode);
+    /* The uponSanitizeElement hook may have detached the node, exactly as
+       above (see _handleHookDetachedNode for the full rationale). */
+    if (_handleHookDetachedNode(currentNode, root)) {
       return true;
     }
 
-    /* Remove any occurrence of processing instructions */
-    if (currentNode.nodeType === NODE_TYPE.progressingInstruction) {
-      _forceRemove(currentNode);
-      return true;
-    }
-
-    /* Remove any kind of possibly harmful comments */
-    if (
-      SAFE_FOR_XML &&
-      currentNode.nodeType === NODE_TYPE.comment &&
-      regExpTest(/<[/\w]/g, currentNode.data)
-    ) {
+    /* Remove mXSS vectors, processing instructions and risky comments */
+    if (_isUnsafeNode(currentNode, tagName)) {
       _forceRemove(currentNode);
       return true;
     }
 
     /* Remove element if anything forbids its presence */
-    if (!ALLOWED_TAGS[tagName] || FORBID_TAGS[tagName]) {
-      /* Check if we have a custom element to handle */
-      if (!FORBID_TAGS[tagName] && _isBasicCustomElement(tagName)) {
-        if (
-          CUSTOM_ELEMENT_HANDLING.tagNameCheck instanceof RegExp &&
-          regExpTest(CUSTOM_ELEMENT_HANDLING.tagNameCheck, tagName)
-        ) {
-          return false;
-        }
+    if (
+      FORBID_TAGS[tagName] ||
+      (!(
+        EXTRA_ELEMENT_HANDLING.tagCheck instanceof Function &&
+        EXTRA_ELEMENT_HANDLING.tagCheck(tagName)
+      ) &&
+        !ALLOWED_TAGS[tagName])
+    ) {
+      const removed = _sanitizeDisallowedNode(currentNode, tagName, root);
 
-        if (
-          CUSTOM_ELEMENT_HANDLING.tagNameCheck instanceof Function &&
-          CUSTOM_ELEMENT_HANDLING.tagNameCheck(tagName)
-        ) {
-          return false;
+      /* A false return means the node is a custom element kept via
+         CUSTOM_ELEMENT_HANDLING - the only keep path through
+         _sanitizeDisallowedNode. Run afterSanitizeElements on it so the
+         element-hook lifecycle matches normal allowlisted elements: a
+         security policy applied in this hook (e.g. stripping an attribute
+         from every surviving element) must not silently skip kept custom
+         elements (GHSA-c2j3-45gr-mqc4). This mirrors the normal-element
+         tail below - the hook runs, then the walker's subsequent
+         _sanitizeAttributes pass sanitizes the element's attributes. The
+         deliberately skipped namespace and fallback-tag removal checks stay
+         skipped; they are removal decisions, not the hook contract. */
+      if (removed === false) {
+        _executeHooks(hooks.afterSanitizeElements, currentNode, null);
+
+        /* The hook may have detached the kept custom element. Same
+           IN_PLACE hazard as the before/upon sites: neutralize the
+           detached subtree before the walker skips past it (see
+           _handleHookDetachedNode). */
+        if (_handleHookDetachedNode(currentNode, root)) {
+          return true;
         }
       }
 
-      /* Keep content except for bad-listed elements */
-      if (KEEP_CONTENT && !FORBID_CONTENTS[tagName]) {
-        const parentNode = getParentNode(currentNode) || currentNode.parentNode;
-        const childNodes = getChildNodes(currentNode) || currentNode.childNodes;
-
-        if (childNodes && parentNode) {
-          const childCount = childNodes.length;
-
-          for (let i = childCount - 1; i >= 0; --i) {
-            const childClone = cloneNode(childNodes[i], true);
-            childClone.__removalCount = (currentNode.__removalCount || 0) + 1;
-            parentNode.insertBefore(childClone, getNextSibling(currentNode));
-          }
-        }
-      }
-
-      _forceRemove(currentNode);
-      return true;
+      return removed;
     }
 
-    /* Check whether element has a valid namespace */
-    if (currentNode instanceof Element && !_checkValidNamespace(currentNode)) {
+    /* Check whether element has a valid namespace.
+       Realm-safe check (GHSA-hpcv-96wg-7vj8): use the cached Node.prototype
+       nodeType getter rather than `instanceof Element`, which is realm-
+       bound and short-circuits to false for any node minted in a different
+       realm — letting a foreign-realm element with a forbidden namespace
+       slip past the namespace check entirely. */
+    const nt = _readNodeType(currentNode);
+    if (nt === NODE_TYPE.element && !_checkValidNamespace(currentNode)) {
       _forceRemove(currentNode);
       return true;
     }
@@ -1121,7 +2386,7 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
       (tagName === 'noscript' ||
         tagName === 'noembed' ||
         tagName === 'noframes') &&
-      regExpTest(/<\/no(script|embed|frames)/i, currentNode.innerHTML)
+      regExpTest(EXPRESSIONS.FALLBACK_TAG_CLOSE, currentNode.innerHTML)
     ) {
       _forceRemove(currentNode);
       return true;
@@ -1130,11 +2395,7 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
     /* Sanitize element content to be template-safe */
     if (SAFE_FOR_TEMPLATES && currentNode.nodeType === NODE_TYPE.text) {
       /* Get the element's text content */
-      content = currentNode.textContent;
-
-      arrayForEach([MUSTACHE_EXPR, ERB_EXPR, TMPLIT_EXPR], (expr) => {
-        content = stringReplace(content, expr, ' ');
-      });
+      const content = _stripTemplateExpressions(currentNode.textContent);
 
       if (currentNode.textContent !== content) {
         arrayPush(DOMPurify.removed, { element: currentNode.cloneNode() });
@@ -1145,7 +2406,14 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
     /* Execute a hook if present */
     _executeHooks(hooks.afterSanitizeElements, currentNode, null);
 
-    return false;
+    /* The afterSanitizeElements hook is the documented place for
+       node.remove() policies, and a detach here is invisible to every later
+       pass: the iterator advances past the detached subtree, so its
+       descendants are never visited, and hook-detached nodes are not in
+       DOMPurify.removed, so the post-walk IN_PLACE pass does not reach them
+       either. Apply the same detach-neutralization invariant as the
+       before/upon sites: true (removed) if the hook detached the node. */
+    return _handleHookDetachedNode(currentNode, root);
   };
 
   /**
@@ -1162,6 +2430,38 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
     lcName: string,
     value: string
   ): boolean {
+    /* FORBID_ATTR must always win, even if ADD_ATTR predicate would allow it */
+    if (FORBID_ATTR[lcName]) {
+      return false;
+    }
+
+    /* Reject declarative-partial-updates patch-linkage attributes
+       (https://github.com/WICG/declarative-partial-updates).
+
+       Empirical note (Chrome 150, verified — see
+       test/declarative-patch-probe-v3.html): expansion is NOT applied after
+       sanitization. For the string path it fires during sanitize()'s own
+       parse, so the walk sees and sanitizes the fully materialized expanded
+       tree — teleports into MathML/SVG integration points included; a
+       weaponized `<template for>`->`<img onerror>` comes back with the handler
+       stripped. For the IN_PLACE path it fires on connection, before the walk.
+       Either way DOMPurify is NOT blind to the patch.
+
+       This removal is therefore defense-in-depth rather than the sole barrier:
+       it prevents live linkage from surviving into the OUTPUT and re-expanding
+       in the caller's context, and keeps behaviour deterministic if a future
+       engine defers expansion. `for` is legitimate only on <label>/<output>;
+       anywhere else (notably <template for>) it links the element to a patch
+       target and teleports or removes an arbitrary DOM range by id/marker name.
+       `patchsrc` fetches remote markup and is treated as a script-loading
+       mechanism (CSP). Gated on SAFE_FOR_XML so the removal groups with the
+       other structural-threat checks and stays overridable, consistent with
+       the rest of the codebase. PI range markers are already removed by
+       _isUnsafeNode. */
+    if (_isPatchLinkageAttribute(lcName, lcTag)) {
+      return false;
+    }
+
     /* Make sure attribute cannot clobber */
     if (
       SANITIZE_DOM &&
@@ -1171,83 +2471,101 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
       return false;
     }
 
+    const nameIsPermitted =
+      ALLOWED_ATTR[lcName] ||
+      (EXTRA_ELEMENT_HANDLING.attributeCheck instanceof Function &&
+        EXTRA_ELEMENT_HANDLING.attributeCheck(lcName, lcTag));
+
     /* Allow valid data-* attributes: At least one character after "-"
         (https://html.spec.whatwg.org/multipage/dom.html#embedding-custom-non-visible-data-with-the-data-*-attributes)
         XML-compatible (https://html.spec.whatwg.org/multipage/infrastructure.html#xml-compatible and http://www.w3.org/TR/xml/#d0e804)
         We don't need to check the value; it's always URI safe. */
-    if (
-      ALLOW_DATA_ATTR &&
-      !FORBID_ATTR[lcName] &&
-      regExpTest(DATA_ATTR, lcName)
-    ) {
-      // This attribute is safe
-    } else if (ALLOW_ARIA_ATTR && regExpTest(ARIA_ATTR, lcName)) {
-      // This attribute is safe
-      /* Otherwise, check the name is permitted */
-    } else if (!ALLOWED_ATTR[lcName] || FORBID_ATTR[lcName]) {
-      if (
-        // First condition does a very basic check if a) it's basically a valid custom element tagname AND
-        // b) if the tagName passes whatever the user has configured for CUSTOM_ELEMENT_HANDLING.tagNameCheck
-        // and c) if the attribute name passes whatever the user has configured for CUSTOM_ELEMENT_HANDLING.attributeNameCheck
+    if (ALLOW_DATA_ATTR && regExpTest(DATA_ATTR, lcName)) {
+      return true;
+    }
+
+    /* Allow valid aria-* attributes, the value is always URI safe */
+    if (ALLOW_ARIA_ATTR && regExpTest(ARIA_ATTR, lcName)) {
+      return true;
+    }
+
+    /* A name outside the allowlist is acceptable on custom-element terms
+       only. The value checks below are intentionally skipped in that case:
+       if the user supplied a tagNameCheck we also allow derived custom
+       elements using the same test, and attributes passing the configured
+       attributeNameCheck are allowed as custom elements define these at
+       their own discretion. */
+    if (!nameIsPermitted) {
+      return (
+        // Condition a) covers a basically valid custom element tag name whose
+        // tag passes the configured tagNameCheck and whose attribute name
+        // passes the configured attributeNameCheck ...
         (_isBasicCustomElement(lcTag) &&
-          ((CUSTOM_ELEMENT_HANDLING.tagNameCheck instanceof RegExp &&
-            regExpTest(CUSTOM_ELEMENT_HANDLING.tagNameCheck, lcTag)) ||
-            (CUSTOM_ELEMENT_HANDLING.tagNameCheck instanceof Function &&
-              CUSTOM_ELEMENT_HANDLING.tagNameCheck(lcTag))) &&
-          ((CUSTOM_ELEMENT_HANDLING.attributeNameCheck instanceof RegExp &&
-            regExpTest(CUSTOM_ELEMENT_HANDLING.attributeNameCheck, lcName)) ||
-            (CUSTOM_ELEMENT_HANDLING.attributeNameCheck instanceof Function &&
-              CUSTOM_ELEMENT_HANDLING.attributeNameCheck(lcName)))) ||
-        // Alternative, second condition checks if it's an `is`-attribute, AND
-        // the value passes whatever the user has configured for CUSTOM_ELEMENT_HANDLING.tagNameCheck
+          _matchesNameCheck(CUSTOM_ELEMENT_HANDLING.tagNameCheck, lcTag) &&
+          _matchesNameCheck(
+            CUSTOM_ELEMENT_HANDLING.attributeNameCheck,
+            lcName,
+            lcTag
+          )) ||
+        // Condition b) covers an `is` attribute whose value passes the
+        // configured tagNameCheck while customized built-in elements are
+        // allowed.
         (lcName === 'is' &&
           CUSTOM_ELEMENT_HANDLING.allowCustomizedBuiltInElements &&
-          ((CUSTOM_ELEMENT_HANDLING.tagNameCheck instanceof RegExp &&
-            regExpTest(CUSTOM_ELEMENT_HANDLING.tagNameCheck, value)) ||
-            (CUSTOM_ELEMENT_HANDLING.tagNameCheck instanceof Function &&
-              CUSTOM_ELEMENT_HANDLING.tagNameCheck(value))))
-      ) {
-        // If user has supplied a regexp or function in CUSTOM_ELEMENT_HANDLING.tagNameCheck, we need to also allow derived custom elements using the same tagName test.
-        // Additionally, we need to allow attributes passing the CUSTOM_ELEMENT_HANDLING.attributeNameCheck user has configured, as custom elements can define these at their own discretion.
-      } else {
-        return false;
-      }
-      /* Check value is safe. First, is attr inert? If so, is safe */
-    } else if (URI_SAFE_ATTRIBUTES[lcName]) {
-      // This attribute is safe
-      /* Check no script, data or unknown possibly unsafe URI
+          _matchesNameCheck(CUSTOM_ELEMENT_HANDLING.tagNameCheck, value))
+      );
+    }
+
+    /* Check value is safe. First, is attr inert? If so, is safe */
+    if (URI_SAFE_ATTRIBUTES[lcName]) {
+      return true;
+    }
+
+    /* Check no script, data or unknown possibly unsafe URI
         unless we know URI values are safe for that attribute */
-    } else if (
-      regExpTest(IS_ALLOWED_URI, stringReplace(value, ATTR_WHITESPACE, ''))
-    ) {
-      // This attribute is safe
-      /* Keep image data URIs alive if src/xlink:href is allowed */
-      /* Further prevent gadget XSS for dynamically built script tags */
-    } else if (
+    if (regExpTest(IS_ALLOWED_URI, stringReplace(value, ATTR_WHITESPACE, ''))) {
+      return true;
+    }
+
+    /* Keep image data URIs alive if src/xlink:href is allowed */
+    /* Further prevent gadget XSS for dynamically built script tags */
+    if (
       (lcName === 'src' || lcName === 'xlink:href' || lcName === 'href') &&
       lcTag !== 'script' &&
       stringIndexOf(value, 'data:') === 0 &&
       DATA_URI_TAGS[lcTag]
     ) {
-      // This attribute is safe
-      /* Allow unknown protocols: This provides support for links that
+      return true;
+    }
+
+    /* Allow unknown protocols: This provides support for links that
         are handled by protocol handlers which may be unknown ahead of
         time, e.g. fb:, spotify: */
-    } else if (
+    if (
       ALLOW_UNKNOWN_PROTOCOLS &&
       !regExpTest(IS_SCRIPT_OR_DATA, stringReplace(value, ATTR_WHITESPACE, ''))
     ) {
-      // This attribute is safe
-      /* Check for binary attributes */
-    } else if (value) {
-      return false;
-    } else {
-      // Binary attributes are safe at this point
-      /* Anything else, presume unsafe, do not add it back */
+      return true;
     }
 
-    return true;
+    /* Only an empty (binary) value remains safe at this point;
+       anything else is presumed unsafe, do not add it back */
+    return !value;
   };
+
+  /* Names the HTML spec reserves from valid-custom-element-name; these must
+   * never be treated as basic custom elements even when a permissive
+   * CUSTOM_ELEMENT_HANDLING.tagNameCheck is configured. */
+  const RESERVED_CUSTOM_ELEMENT_NAMES = addToSet({}, [
+    'annotation-xml',
+    'color-profile',
+    'font-face',
+    'font-face-format',
+    'font-face-name',
+    'font-face-src',
+    'font-face-uri',
+    'missing-glyph',
+  ]);
 
   /**
    * _isBasicCustomElement
@@ -1257,8 +2575,143 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
    * @param tagName name of the tag of the node to sanitize
    * @returns Returns true if the tag name meets the basic criteria for a custom element, otherwise false.
    */
-  const _isBasicCustomElement = function (tagName: string): RegExpMatchArray {
-    return tagName !== 'annotation-xml' && stringMatch(tagName, CUSTOM_ELEMENT);
+  const _isBasicCustomElement = function (tagName: string): boolean {
+    return (
+      !RESERVED_CUSTOM_ELEMENT_NAMES[stringToLowerCase(tagName)] &&
+      regExpTest(CUSTOM_ELEMENT, tagName)
+    );
+  };
+
+  /**
+   * Wrap an attribute value in the matching Trusted Types object when
+   * the active policy requires it. Namespaced attributes pass through
+   * unchanged (no TT support yet, see
+   * https://bugs.chromium.org/p/chromium/issues/detail?id=1305293).
+   *
+   * @param lcTag lowercase tag name of the containing element
+   * @param lcName lowercase attribute name
+   * @param namespaceURI the attribute's namespace, if any
+   * @param value the attribute value to wrap
+   * @return the value, wrapped when Trusted Types demand it
+   */
+  const _applyTrustedTypesToAttribute = function (
+    lcTag: string,
+    lcName: string,
+    namespaceURI: string | null,
+    value: string
+  ): string {
+    if (
+      trustedTypesPolicy &&
+      typeof trustedTypes === 'object' &&
+      typeof trustedTypes.getAttributeType === 'function' &&
+      !namespaceURI
+    ) {
+      switch (trustedTypes.getAttributeType(lcTag, lcName)) {
+        case 'TrustedHTML': {
+          return _createTrustedHTML(value);
+        }
+
+        case 'TrustedScriptURL': {
+          return _createTrustedScriptURL(value);
+        }
+
+        default: {
+          break;
+        }
+      }
+    }
+
+    return value;
+  };
+
+  /**
+   * Write a modified attribute value back onto the element. On
+   * success, re-probe for clobbering introduced by the new value and
+   * remove the element when found; otherwise, when this writeback is the
+   * recreate half of the SANITIZE_NAMED_PROPS remove-and-recreate, pop the
+   * removal entry that path recorded so it does not show as removed. On
+   * failure, remove the attribute instead.
+   *
+   * Returns true only on a clean write (the value was set and the new value
+   * introduced no clobbering). The caller uses that, together with its own
+   * knowledge of whether this attribute pushed a DOMPurify.removed record, to
+   * decide whether to pop that record. The pop must happen ONLY for the
+   * named-prop remove-and-recreate; popping on any other value change (trim,
+   * template scrubbing, Trusted Types) would consume an unrelated _forceRemove
+   * subtree-cleanup record and let that detached subtree keep a live event
+   * handler through the IN_PLACE neutralization pass (SO-001).
+   *
+   * @param currentNode the element carrying the attribute
+   * @param name the attribute name as present on the element
+   * @param namespaceURI the attribute's namespace, if any
+   * @param value the new attribute value
+   * @return true if the value was written without introducing clobbering
+   */
+  const _setAttributeValue = function (
+    currentNode: Element,
+    name: string,
+    namespaceURI: string | null,
+    value: string
+  ): boolean {
+    try {
+      if (namespaceURI) {
+        currentNode.setAttributeNS(namespaceURI, name, value);
+      } else {
+        /* Fallback to setAttribute() for browser-unrecognized namespaces e.g. "x-schema". */
+        currentNode.setAttribute(name, value);
+      }
+
+      if (_isClobbered(currentNode)) {
+        _forceRemove(currentNode);
+        return false;
+      }
+
+      return true;
+    } catch (_) {
+      _removeAttribute(name, currentNode);
+      return false;
+    }
+  };
+
+  /**
+   * _isUnsafeAttributeValue
+   *
+   * Value-based attribute checks that the attribute walk applies before any
+   * hook can force-keep an attribute, shared with the public
+   * isValidAttribute() so that it never approves a value sanitize() would
+   * strip.
+   *
+   * @param name the attribute name as found on the node (case preserved)
+   * @param value the attribute value
+   * @returns true if the attribute must be removed because of its value
+   */
+  const _isUnsafeAttributeValue = function (
+    name: string,
+    value: string
+  ): boolean {
+    /* Work around a security issue with comments inside attributes, and
+       raw-text closers that re-contextualize the value on a later reparse */
+    if (
+      SAFE_FOR_XML &&
+      regExpTest(
+        /((--!?|])>)|<\/(style|script|title|xmp|textarea|noscript|iframe|noembed|noframes)/i,
+        value
+      )
+    ) {
+      return true;
+    }
+
+    /* Make sure we cannot easily use animated hrefs, even if animations are
+       allowed. Compared case-insensitively on purpose: in
+       application/xhtml+xml mode names keep their case, and the real SVG
+       attribute is spelled attributeName, which 'attributename' would
+       never match (GHSA-c6gr-qvv4-5v3f). In XHTML a lowercase
+       `attributename` is not the SMIL attribute, so also stripping it
+       there costs nothing. */
+    return (
+      stringToLowerCase(name) === 'attributename' &&
+      stringMatch(value, 'href') !== null
+    );
   };
 
   /**
@@ -1270,10 +2723,22 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
    * @protect setAttribute
    *
    * @param currentNode to sanitize
+   * @param root the current walk root
    */
-  const _sanitizeAttributes = function (currentNode: Element): void {
+  const _sanitizeAttributes = function (
+    currentNode: Element,
+    root: Node
+  ): void {
     /* Execute a hook if present */
     _executeHooks(hooks.beforeSanitizeAttributes, currentNode, null);
+
+    /* A hook may have detached the node - the attribute hooks can detach
+       exactly like the element hooks can, and the walker will not revisit
+       the detached subtree. Treat it as removed and, on the IN_PLACE path,
+       neutralize it (see _handleHookDetachedNode for the full rationale). */
+    if (_handleHookDetachedNode(currentNode, root)) {
+      return;
+    }
 
     const { attributes } = currentNode;
 
@@ -1281,6 +2746,15 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
     if (!attributes || _isClobbered(currentNode)) {
       return;
     }
+
+    /* Same lazy-install guard as uponSanitizeElement (see there): fork the
+       attribute allowlist off its shared binding before a hook can see it. */
+    ALLOWED_ATTR = _forkSharedAllowlist(
+      hooks.uponSanitizeAttribute,
+      ALLOWED_ATTR,
+      DEFAULT_ALLOWED_ATTR,
+      SET_CONFIG_ALLOWED_ATTR
+    );
 
     const hookEvent = {
       attrName: '',
@@ -1290,6 +2764,7 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
       forceKeepAttr: undefined,
     };
     let l = attributes.length;
+    const lcTag = transformCaseFunc(currentNode.nodeName);
 
     /* Go backwards over all attributes; safely remove bad ones */
     while (l--) {
@@ -1299,6 +2774,16 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
 
       const initValue = attrValue;
       let value = name === 'value' ? initValue : stringTrim(initValue);
+
+      /* Tracks whether this specific attribute pushed a DOMPurify.removed
+         record that a later _setAttributeValue() writeback is expected to pop
+         back off (the SANITIZE_NAMED_PROPS remove-and-recreate below is the
+         only path that does). A value that merely changed via trim, template
+         scrubbing, or Trusted Types pushes no such record, so its writeback
+         must NOT pop — otherwise it consumes an unrelated _forceRemove subtree
+         record and that detached subtree escapes the IN_PLACE handler-
+         neutralization pass (SO-001). */
+      let recreatedNamedProp = false;
 
       /* Execute a hook if present */
       hookEvent.attrName = lcName;
@@ -1311,101 +2796,89 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
       /* Full DOM Clobbering protection via namespace isolation,
        * Prefix id and name attributes with `user-content-`
        */
-      if (SANITIZE_NAMED_PROPS && (lcName === 'id' || lcName === 'name')) {
+      if (
+        SANITIZE_NAMED_PROPS &&
+        (lcName === 'id' || lcName === 'name') &&
+        stringIndexOf(value, SANITIZE_NAMED_PROPS_PREFIX) !== 0
+      ) {
         // Remove the attribute with this value
-        _removeAttribute(name, currentNode);
-
+        _removeAttribute(name, currentNode, attr);
         // Prefix the value and later re-create the attribute with the sanitized value
         value = SANITIZE_NAMED_PROPS_PREFIX + value;
+        // This attribute owns the record just pushed; its recreate writeback
+        // is the one allowed to pop it back off.
+        recreatedNamedProp = true;
       }
+      // Else: already prefixed, leave the attribute alone — the prefix is
+      // itself the clobbering protection, and re-applying it is incorrect.
 
-      /* Work around a security issue with comments inside attributes */
-      if (SAFE_FOR_XML && regExpTest(/((--!?|])>)|<\/(style|title)/i, value)) {
-        _removeAttribute(name, currentNode);
+      /* Value checks that apply regardless of hooks (comment / raw-text
+         closers in the value, animated hrefs); see _isUnsafeAttributeValue. */
+      if (_isUnsafeAttributeValue(name, value)) {
+        _removeAttribute(name, currentNode, attr);
         continue;
       }
 
-      /* Did the hooks approve of the attribute? */
+      /* Did the hooks force-keep the attribute? */
       if (hookEvent.forceKeepAttr) {
         continue;
       }
 
       /* Did the hooks approve of the attribute? */
       if (!hookEvent.keepAttr) {
-        _removeAttribute(name, currentNode);
+        _removeAttribute(name, currentNode, attr);
         continue;
       }
 
       /* Work around a security issue in jQuery 3.0 */
-      if (!ALLOW_SELF_CLOSE_IN_ATTR && regExpTest(/\/>/i, value)) {
-        _removeAttribute(name, currentNode);
+      if (
+        !ALLOW_SELF_CLOSE_IN_ATTR &&
+        regExpTest(EXPRESSIONS.SELF_CLOSING_TAG, value)
+      ) {
+        _removeAttribute(name, currentNode, attr);
         continue;
       }
 
       /* Sanitize attribute content to be template-safe */
       if (SAFE_FOR_TEMPLATES) {
-        arrayForEach([MUSTACHE_EXPR, ERB_EXPR, TMPLIT_EXPR], (expr) => {
-          value = stringReplace(value, expr, ' ');
-        });
+        value = _stripTemplateExpressions(value);
       }
 
       /* Is `value` valid for this attribute? */
-      const lcTag = transformCaseFunc(currentNode.nodeName);
       if (!_isValidAttribute(lcTag, lcName, value)) {
-        _removeAttribute(name, currentNode);
+        _removeAttribute(name, currentNode, attr);
         continue;
       }
 
       /* Handle attributes that require Trusted Types */
-      if (
-        trustedTypesPolicy &&
-        typeof trustedTypes === 'object' &&
-        typeof trustedTypes.getAttributeType === 'function'
-      ) {
-        if (namespaceURI) {
-          /* Namespaces are not yet supported, see https://bugs.chromium.org/p/chromium/issues/detail?id=1305293 */
-        } else {
-          switch (trustedTypes.getAttributeType(lcTag, lcName)) {
-            case 'TrustedHTML': {
-              value = trustedTypesPolicy.createHTML(value);
-              break;
-            }
-
-            case 'TrustedScriptURL': {
-              value = trustedTypesPolicy.createScriptURL(value);
-              break;
-            }
-
-            default: {
-              break;
-            }
-          }
-        }
-      }
+      value = _applyTrustedTypesToAttribute(lcTag, lcName, namespaceURI, value);
 
       /* Handle invalid data-* attribute set by try-catching it */
       if (value !== initValue) {
-        try {
-          if (namespaceURI) {
-            currentNode.setAttributeNS(namespaceURI, name, value);
-          } else {
-            /* Fallback to setAttribute() for browser-unrecognized namespaces e.g. "x-schema". */
-            currentNode.setAttribute(name, value);
-          }
+        const cleanWrite = _setAttributeValue(
+          currentNode,
+          name,
+          namespaceURI,
+          value
+        );
 
-          if (_isClobbered(currentNode)) {
-            _forceRemove(currentNode);
-          } else {
-            arrayPop(DOMPurify.removed);
-          }
-        } catch (_) {
-          _removeAttribute(name, currentNode);
+        /* Only the named-prop remove-and-recreate owns a DOMPurify.removed
+           record to pop; a plain trim/template/Trusted-Types writeback owns
+           none, so popping here would drop an unrelated subtree's cleanup
+           record (SO-001). */
+        if (cleanWrite && recreatedNamedProp) {
+          arrayPop(DOMPurify.removed);
         }
       }
     }
 
     /* Execute a hook if present */
     _executeHooks(hooks.afterSanitizeAttributes, currentNode, null);
+
+    /* Same detach re-check as after beforeSanitizeAttributes: this is the
+       last hook that runs for the node, so a detach here would otherwise
+       hand the caller a live, handler-bearing subtree. */
+    _handleHookDetachedNode(currentNode, root);
   };
 
   /**
@@ -1425,19 +2898,121 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
       _executeHooks(hooks.uponSanitizeShadowNode, shadowNode, null);
 
       /* Sanitize tags and elements */
-      _sanitizeElements(shadowNode);
+      _sanitizeElements(shadowNode, fragment);
 
       /* Check attributes next */
-      _sanitizeAttributes(shadowNode);
+      _sanitizeAttributes(shadowNode, fragment);
 
-      /* Deep shadow DOM detected */
-      if (shadowNode.content instanceof DocumentFragment) {
+      /* Deep shadow DOM detected.
+         Realm-safe check (GHSA-hpcv-96wg-7vj8): use nodeType against the
+         DOCUMENT_FRAGMENT_NODE constant rather than instanceof, so we
+         recurse into <template>.content from foreign realms too. */
+      if (_isDocumentFragment(shadowNode.content)) {
         _sanitizeShadowDOM(shadowNode.content);
       }
+
+      /* An element iterated here may itself host an attached
+         shadow root. The default NodeIterator does not enter shadow
+         trees, so a shadow root nested inside template.content was
+         previously reached by no walk at all (the pre-pass at
+         _sanitizeAttachedShadowRoots descends via childNodes, which
+         doesn't enter template.content; the template-content recursion
+         above iterates the content but never inspected shadowRoot).
+         Walk it explicitly. The nodeType guard avoids reading
+         shadowRoot off text / comment / CDATA / PI nodes that the
+         iterator also surfaces. */
+      if (_readNodeType(shadowNode) === NODE_TYPE.element) {
+        const innerSr = getShadowRoot(shadowNode);
+        if (_isDocumentFragment(innerSr)) {
+          _sanitizeAttachedShadowRoots(innerSr);
+          _sanitizeShadowDOM(innerSr);
+        }
+      }
+    }
+
+    /* Post-walk template-expression safety net, mirroring the light-DOM
+       passes on `dirty` / `body`. The per-node strip above (via
+       _sanitizeElements) only sees each text node in isolation, so an
+       expression split across text siblings by a disallowed separator element
+       (e.g. `$` <object> `{alert(1)}`) survives: each fragment matches no
+       delimiter regex on its own, and once the separator is removed the
+       fragments become adjacent and serialize as one complete expression.
+       The light-DOM net catches exactly this, but NodeIterator does not
+       descend into shadow trees and node.normalize() does not merge text
+       across the shadow boundary, so the fragments were never re-examined as
+       a merged unit. normalize() here (inside _scrubTemplateExpressions)
+       merges them and re-strips. Deliberately the non-recursive variant: each
+       nested shadow root and template content is walked by its own
+       _sanitizeShadowDOM call above and scrubbed there, so every fragment is
+       scrubbed exactly once (the recursive variant would make this quadratic
+       in nesting depth). Gated on SAFE_FOR_TEMPLATES like the light-DOM
+       passes, and placed before the afterSanitizeShadowDOM hook so that hook
+       observes the finalized fragment. */
+    if (SAFE_FOR_TEMPLATES) {
+      _scrubOwnCharacterData(fragment as unknown as Element);
     }
 
     /* Execute a hook if present */
     _executeHooks(hooks.afterSanitizeShadowDOM, fragment, null);
+  };
+
+  /**
+   * Sanitizes every attached shadow root under `root`, since the node
+   * iterator does not enter shadow trees. Needed for IN_PLACE input and for
+   * DOM input whose clonable shadow roots were copied by importNode().
+   *
+   * @param root the subtree root to walk for attached shadow roots
+   */
+  const _sanitizeAttachedShadowRoots = function (root: Node): void {
+    /* Explicit stack, so deep trees cannot overflow the call stack. An item is
+       a node to walk or a shadow root to sanitize. Items are processed in
+       reverse push order: a shadow root is walked first (finding nested
+       roots), then sanitized, then template content, then the children. */
+    const stack: Array<{ node: Node | null; shadow: DocumentFragment | null }> =
+      [{ node: root, shadow: null }];
+
+    while (stack.length > 0) {
+      const item = stack.pop();
+
+      if (item.shadow) {
+        _sanitizeShadowDOM(item.shadow);
+        continue;
+      }
+
+      const node = item.node;
+      const nodeType = _readNodeType(node);
+      const isElement = nodeType === NODE_TYPE.element;
+
+      // Children, copied now since hooks may detach siblings mid-walk
+      const childNodes = getChildNodes(node);
+      if (childNodes) {
+        for (let i = childNodes.length - 1; i >= 0; --i) {
+          stack.push({ node: childNodes[i], shadow: null });
+        }
+      }
+
+      // Template content
+      if (isElement) {
+        const rootName = getNodeName ? getNodeName(node) : null;
+        if (
+          typeof rootName === 'string' &&
+          transformCaseFunc(rootName) === 'template'
+        ) {
+          const content = (node as HTMLTemplateElement).content;
+          if (_isDocumentFragment(content)) {
+            stack.push({ node: content, shadow: null });
+          }
+        }
+      }
+
+      // Shadow root: walk it, then sanitize it (realm-safe nodeType check)
+      if (isElement) {
+        const sr = getShadowRoot(node);
+        if (_isDocumentFragment(sr)) {
+          stack.push({ node: null, shadow: sr }, { node: sr, shadow: null });
+        }
+      }
+    }
   };
 
   // eslint-disable-next-line complexity
@@ -1456,13 +3031,10 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
 
     /* Stringify, in case dirty is an object */
     if (typeof dirty !== 'string' && !_isNode(dirty)) {
-      if (typeof dirty.toString === 'function') {
-        dirty = dirty.toString();
-        if (typeof dirty !== 'string') {
-          throw typeErrorCreate('dirty is not a string, aborting');
-        }
-      } else {
-        throw typeErrorCreate('toString is not a function');
+      dirty = stringifyValue(dirty);
+
+      if (typeof dirty !== 'string') {
+        throw typeErrorCreate('dirty is not a string, aborting');
       }
     }
 
@@ -1472,29 +3044,75 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
     }
 
     /* Assign config vars */
-    if (!SET_CONFIG) {
+    if (SET_CONFIG) {
+      /* Persistent setConfig() path: _parseConfig is skipped, so the sets are
+       * not re-derived per call. Restore them from the pristine bindings
+       * captured at setConfig() time so a previous call's hook clone (mutated
+       * below) does not carry over. */
+      ALLOWED_TAGS = SET_CONFIG_ALLOWED_TAGS;
+      ALLOWED_ATTR = SET_CONFIG_ALLOWED_ATTR;
+    } else {
       _parseConfig(cfg);
+    }
+
+    /* Clone the hook-mutable allowlists before the walk whenever an
+     * uponSanitize* hook is registered. The hook event exposes ALLOWED_TAGS
+     * and ALLOWED_ATTR by reference (as allowedTags / allowedAttributes), so
+     * a hook that widens them would otherwise mutate the shared set
+     * permanently: across later calls and across every element. Cloning per
+     * walk keeps documented in-call widening working while scoping it to the
+     * call. A single guard for both config paths - the per-call path rebinds
+     * the sets in _parseConfig each call, the persistent path restores them
+     * from the captured bindings just above - so the two cannot diverge. */
+    if (
+      hooks.uponSanitizeElement.length > 0 ||
+      hooks.uponSanitizeAttribute.length > 0
+    ) {
+      ALLOWED_TAGS = clone(ALLOWED_TAGS);
+    }
+
+    if (hooks.uponSanitizeAttribute.length > 0) {
+      ALLOWED_ATTR = clone(ALLOWED_ATTR);
     }
 
     /* Clean up removed elements */
     DOMPurify.removed = [];
 
-    /* Check if dirty is correctly typed for IN_PLACE */
-    if (typeof dirty === 'string') {
-      IN_PLACE = false;
-    }
+    /* Resolved per call: setConfig() skips _parseConfig, so writing IN_PLACE
+       here would leak into later calls (REPORT-2). */
+    const inPlace = IN_PLACE && typeof dirty !== 'string' && _isNode(dirty);
+    /* IN_PLACE: the caller's nodes before any hook or custom element can run,
+       and the visit tracking of an outer call this one may be nested in */
+    let inPlaceNodes: Node[] = [];
+    const outerVisited = IN_PLACE_VISITED;
 
-    if (IN_PLACE) {
-      /* Do some early pre-sanitization to avoid unsafe root nodes */
-      if ((dirty as Node).nodeName) {
-        const tagName = transformCaseFunc((dirty as Node).nodeName);
+    if (inPlace) {
+      _neutralizePatchLinkage(dirty as Node);
+
+      /* The root must be an allowed tag and not clobbered: a parentless root
+         cannot be removed, so it would come back unsanitized. Its name is read
+         through the cached getter, a clobbering child could shadow it. */
+      const nn = _readNodeName(dirty as Node);
+      if (typeof nn === 'string') {
+        const tagName = transformCaseFunc(nn);
         if (!ALLOWED_TAGS[tagName] || FORBID_TAGS[tagName]) {
+          _neutralizeRoot(dirty as Node);
           throw typeErrorCreate(
             'root node is forbidden and cannot be sanitized in-place'
           );
         }
       }
-    } else if (dirty instanceof Node) {
+
+      if (_isClobbered(dirty as Element)) {
+        _neutralizeRoot(dirty as Node);
+        throw typeErrorCreate(
+          'root node is clobbered and cannot be sanitized in-place'
+        );
+      }
+
+      inPlaceNodes = _collectLiveNodes(dirty as Node);
+      IN_PLACE_VISITED = setCreate();
+    } else if (_isNode(dirty)) {
       /* If dirty is a DOM element, append to an empty document to avoid
          elements being stripped by the parser */
       body = _initDocument('<!---->');
@@ -1511,6 +3129,21 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
         // eslint-disable-next-line unicorn/prefer-dom-node-append
         body.appendChild(importedNode);
       }
+
+      /* Clonable shadow roots are deep-cloned by importNode(); sanitize
+         them before the main iterator runs, since the iterator does not
+         descend into shadow trees. The walk routes every read through a
+         cached prototype getter so clobbering descendants on a form root
+         cannot hide a shadow host from this pass.
+
+         Traverse from `body`, not `importedNode`: when importedNode is a
+         DocumentFragment, the appendChild() above moves its children into
+         `body` and leaves the fragment empty, so walking importedNode would
+         scan nothing and miss every attached shadow host now under `body`
+         (SO-003). In the BODY/HTML branches `body === importedNode`, so this
+         is equivalent there; in the element branch `body` contains the
+         appended element and its descendants. `body` covers all three. */
+      _sanitizeAttachedShadowRoots(body);
     } else {
       /* Exit directly if we have nothing to do */
       if (
@@ -1521,7 +3154,7 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
         dirty.indexOf('<') === -1
       ) {
         return trustedTypesPolicy && RETURN_TRUSTED_TYPE
-          ? trustedTypesPolicy.createHTML(dirty)
+          ? _createTrustedHTML(dirty)
           : dirty;
       }
 
@@ -1540,29 +3173,62 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
     }
 
     /* Get node iterator */
-    const nodeIterator = _createNodeIterator(IN_PLACE ? dirty : body);
+    const walkRoot: Node = inPlace ? (dirty as Node) : body;
 
-    /* Now start iterating over the created document */
-    while ((currentNode = nodeIterator.nextNode())) {
-      /* Sanitize tags and elements */
-      _sanitizeElements(currentNode);
-
-      /* Check attributes next */
-      _sanitizeAttributes(currentNode);
-
-      /* Shadow DOM detected, sanitize it */
-      if (currentNode.content instanceof DocumentFragment) {
-        _sanitizeShadowDOM(currentNode.content);
+    /* If anything throws, an in-place tree is stripped bare before the error
+       propagates, never left half-sanitized. */
+    try {
+      if (inPlace) {
+        _sanitizeAttachedShadowRoots(dirty as Node);
       }
+
+      const nodeIterator = _createNodeIterator(walkRoot);
+      while ((currentNode = nodeIterator.nextNode())) {
+        _sanitizeElements(currentNode, walkRoot);
+        _sanitizeAttributes(currentNode, walkRoot);
+
+        // Template content (realm-safe nodeType check)
+        if (_isDocumentFragment(currentNode.content)) {
+          _sanitizeShadowDOM(currentNode.content);
+        }
+      }
+
+      if (inPlace) {
+        _sanitizeUnvisitedNodes(dirty as Node, inPlaceNodes);
+      }
+    } catch (error) {
+      if (inPlace) {
+        _neutralizeRoot(dirty as Node);
+        _neutralizeDiscarded(dirty as Node, inPlaceNodes);
+      }
+
+      throw error;
+    } finally {
+      IN_PLACE_VISITED = outerVisited;
     }
 
-    /* If we sanitized `dirty` in-place, return it. */
-    if (IN_PLACE) {
+    if (inPlace) {
+      // A removed root has no safe state to return
+      if (_neutralizeDiscarded(dirty as Node, inPlaceNodes)) {
+        throw typeErrorCreate(
+          'a node selected for removal could not be safely returned; ' +
+            'refusing to sanitize in place'
+        );
+      }
+
+      if (SAFE_FOR_TEMPLATES) {
+        _scrubTemplateExpressions(dirty as Element);
+      }
+
       return dirty;
     }
 
     /* Return sanitized string or DOM */
     if (RETURN_DOM) {
+      if (SAFE_FOR_TEMPLATES) {
+        _scrubTemplateExpressions(body);
+      }
+
       if (RETURN_DOM_FRAGMENT) {
         returnNode = createDocumentFragment.call(body.ownerDocument);
 
@@ -1605,24 +3271,33 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
 
     /* Sanitize final string template-safe */
     if (SAFE_FOR_TEMPLATES) {
-      arrayForEach([MUSTACHE_EXPR, ERB_EXPR, TMPLIT_EXPR], (expr) => {
-        serializedHTML = stringReplace(serializedHTML, expr, ' ');
-      });
+      serializedHTML = _stripTemplateExpressions(serializedHTML);
     }
 
     return trustedTypesPolicy && RETURN_TRUSTED_TYPE
-      ? trustedTypesPolicy.createHTML(serializedHTML)
+      ? _createTrustedHTML(serializedHTML)
       : serializedHTML;
   };
 
   DOMPurify.setConfig = function (cfg = {}) {
     _parseConfig(cfg);
     SET_CONFIG = true;
+    SET_CONFIG_ALLOWED_TAGS = ALLOWED_TAGS;
+    SET_CONFIG_ALLOWED_ATTR = ALLOWED_ATTR;
   };
 
   DOMPurify.clearConfig = function () {
     CONFIG = null;
     SET_CONFIG = false;
+    SET_CONFIG_ALLOWED_TAGS = null;
+    SET_CONFIG_ALLOWED_ATTR = null;
+
+    // Drop any caller-supplied Trusted Types policy so it cannot poison later
+    // `RETURN_TRUSTED_TYPE` output. The internal default policy (cached, and
+    // never recreated — Trusted Types throws on duplicate names) is restored by
+    // the next `_parseConfig`. See GHSA-vxr8-fq34-vvx9.
+    trustedTypesPolicy = defaultTrustedTypesPolicy;
+    emptyHTML = '';
   };
 
   DOMPurify.isValidAttribute = function (tag, attr, value) {
@@ -1633,18 +3308,50 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
 
     const lcTag = transformCaseFunc(tag);
     const lcName = transformCaseFunc(attr);
+
+    /* Apply the same value checks sanitize() applies to an attribute when no
+       hook intervenes, so a value approved here is one sanitize() would also
+       keep: comment / raw-text closers, animated hrefs, and the jQuery 3.0
+       self-closing-tag pattern. */
+    if (
+      typeof value === 'string' &&
+      (_isUnsafeAttributeValue(attr, value) ||
+        (!ALLOW_SELF_CLOSE_IN_ATTR &&
+          regExpTest(EXPRESSIONS.SELF_CLOSING_TAG, value)))
+    ) {
+      return false;
+    }
+
     return _isValidAttribute(lcTag, lcName, value);
   };
 
-  DOMPurify.addHook = function (entryPoint, hookFunction) {
+  DOMPurify.addHook = function (
+    entryPoint: keyof HooksMap,
+    hookFunction: HookFunction
+  ) {
     if (typeof hookFunction !== 'function') {
+      return;
+    }
+
+    /* Reject unknown entry points. Without this, a non-hook key (e.g.
+     * '__proto__') indexes off the prototype chain rather than a real
+     * hook array, and arrayPush then writes to Object.prototype. Guard
+     * with an own-property check against the known hook names. */
+    if (!objectHasOwnProperty(hooks, entryPoint)) {
       return;
     }
 
     arrayPush(hooks[entryPoint], hookFunction);
   };
 
-  DOMPurify.removeHook = function (entryPoint, hookFunction) {
+  DOMPurify.removeHook = function (
+    entryPoint: keyof HooksMap,
+    hookFunction: HookFunction
+  ) {
+    if (!objectHasOwnProperty(hooks, entryPoint)) {
+      return undefined;
+    }
+
     if (hookFunction !== undefined) {
       const index = arrayLastIndexOf(hooks[entryPoint], hookFunction);
 
@@ -1656,7 +3363,11 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
     return arrayPop(hooks[entryPoint]);
   };
 
-  DOMPurify.removeHooks = function (entryPoint) {
+  DOMPurify.removeHooks = function (entryPoint: keyof HooksMap) {
+    if (!objectHasOwnProperty(hooks, entryPoint)) {
+      return;
+    }
+
     hooks[entryPoint] = [];
   };
 
@@ -1668,348 +3379,3 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
 }
 
 export default createDOMPurify();
-
-export interface DOMPurify {
-  /**
-   * Creates a DOMPurify instance using the given window-like object. Defaults to `window`.
-   */
-  (root?: WindowLike): DOMPurify;
-
-  /**
-   * Version label, exposed for easier checks
-   * if DOMPurify is up to date or not
-   */
-  version: string;
-
-  /**
-   * Array of elements that DOMPurify removed during sanitation.
-   * Empty if nothing was removed.
-   */
-  removed: Array<RemovedElement | RemovedAttribute>;
-
-  /**
-   * Expose whether this browser supports running the full DOMPurify.
-   */
-  isSupported: boolean;
-
-  /**
-   * Set the configuration once.
-   *
-   * @param cfg configuration object
-   */
-  setConfig(cfg?: Config): void;
-
-  /**
-   * Removes the configuration.
-   */
-  clearConfig(): void;
-
-  /**
-   * Provides core sanitation functionality.
-   *
-   * @param dirty string or DOM node
-   * @param cfg object
-   * @returns Sanitized TrustedHTML.
-   */
-  sanitize(
-    dirty: string | Node,
-    cfg: Config & { RETURN_TRUSTED_TYPE: true }
-  ): TrustedHTML;
-
-  /**
-   * Provides core sanitation functionality.
-   *
-   * @param dirty DOM node
-   * @param cfg object
-   * @returns Sanitized DOM node.
-   */
-  sanitize(dirty: Node, cfg: Config & { IN_PLACE: true }): Node;
-
-  /**
-   * Provides core sanitation functionality.
-   *
-   * @param dirty string or DOM node
-   * @param cfg object
-   * @returns Sanitized DOM node.
-   */
-  sanitize(dirty: string | Node, cfg: Config & { RETURN_DOM: true }): Node;
-
-  /**
-   * Provides core sanitation functionality.
-   *
-   * @param dirty string or DOM node
-   * @param cfg object
-   * @returns Sanitized document fragment.
-   */
-  sanitize(
-    dirty: string | Node,
-    cfg: Config & { RETURN_DOM_FRAGMENT: true }
-  ): DocumentFragment;
-
-  /**
-   * Provides core sanitation functionality.
-   *
-   * @param dirty string or DOM node
-   * @param cfg object
-   * @returns Sanitized string.
-   */
-  sanitize(dirty: string | Node, cfg?: Config): string;
-
-  /**
-   * Checks if an attribute value is valid.
-   * Uses last set config, if any. Otherwise, uses config defaults.
-   *
-   * @param tag Tag name of containing element.
-   * @param attr Attribute name.
-   * @param value Attribute value.
-   * @returns Returns true if `value` is valid. Otherwise, returns false.
-   */
-  isValidAttribute(tag: string, attr: string, value: string): boolean;
-
-  /**
-   * Adds a DOMPurify hook.
-   *
-   * @param entryPoint entry point for the hook to add
-   * @param hookFunction function to execute
-   */
-  addHook(entryPoint: BasicHookName, hookFunction: NodeHook): void;
-
-  /**
-   * Adds a DOMPurify hook.
-   *
-   * @param entryPoint entry point for the hook to add
-   * @param hookFunction function to execute
-   */
-  addHook(entryPoint: ElementHookName, hookFunction: ElementHook): void;
-
-  /**
-   * Adds a DOMPurify hook.
-   *
-   * @param entryPoint entry point for the hook to add
-   * @param hookFunction function to execute
-   */
-  addHook(
-    entryPoint: DocumentFragmentHookName,
-    hookFunction: DocumentFragmentHook
-  ): void;
-
-  /**
-   * Adds a DOMPurify hook.
-   *
-   * @param entryPoint entry point for the hook to add
-   * @param hookFunction function to execute
-   */
-  addHook(
-    entryPoint: 'uponSanitizeElement',
-    hookFunction: UponSanitizeElementHook
-  ): void;
-
-  /**
-   * Adds a DOMPurify hook.
-   *
-   * @param entryPoint entry point for the hook to add
-   * @param hookFunction function to execute
-   */
-  addHook(
-    entryPoint: 'uponSanitizeAttribute',
-    hookFunction: UponSanitizeAttributeHook
-  ): void;
-
-  /**
-   * Remove a DOMPurify hook at a given entryPoint
-   * (pops it from the stack of hooks if hook not specified)
-   *
-   * @param entryPoint entry point for the hook to remove
-   * @param hookFunction optional specific hook to remove
-   * @returns removed hook
-   */
-  removeHook(
-    entryPoint: BasicHookName,
-    hookFunction?: NodeHook
-  ): NodeHook | undefined;
-
-  /**
-   * Remove a DOMPurify hook at a given entryPoint
-   * (pops it from the stack of hooks if hook not specified)
-   *
-   * @param entryPoint entry point for the hook to remove
-   * @param hookFunction optional specific hook to remove
-   * @returns removed hook
-   */
-  removeHook(
-    entryPoint: ElementHookName,
-    hookFunction?: ElementHook
-  ): ElementHook | undefined;
-
-  /**
-   * Remove a DOMPurify hook at a given entryPoint
-   * (pops it from the stack of hooks if hook not specified)
-   *
-   * @param entryPoint entry point for the hook to remove
-   * @param hookFunction optional specific hook to remove
-   * @returns removed hook
-   */
-  removeHook(
-    entryPoint: DocumentFragmentHookName,
-    hookFunction?: DocumentFragmentHook
-  ): DocumentFragmentHook | undefined;
-
-  /**
-   * Remove a DOMPurify hook at a given entryPoint
-   * (pops it from the stack of hooks if hook not specified)
-   *
-   * @param entryPoint entry point for the hook to remove
-   * @param hookFunction optional specific hook to remove
-   * @returns removed hook
-   */
-  removeHook(
-    entryPoint: 'uponSanitizeElement',
-    hookFunction?: UponSanitizeElementHook
-  ): UponSanitizeElementHook | undefined;
-
-  /**
-   * Remove a DOMPurify hook at a given entryPoint
-   * (pops it from the stack of hooks if hook not specified)
-   *
-   * @param entryPoint entry point for the hook to remove
-   * @param hookFunction optional specific hook to remove
-   * @returns removed hook
-   */
-  removeHook(
-    entryPoint: 'uponSanitizeAttribute',
-    hookFunction?: UponSanitizeAttributeHook
-  ): UponSanitizeAttributeHook | undefined;
-
-  /**
-   * Removes all DOMPurify hooks at a given entryPoint
-   *
-   * @param entryPoint entry point for the hooks to remove
-   */
-  removeHooks(entryPoint: HookName): void;
-
-  /**
-   * Removes all DOMPurify hooks.
-   */
-  removeAllHooks(): void;
-}
-
-/**
- * An element removed by DOMPurify.
- */
-export interface RemovedElement {
-  /**
-   * The element that was removed.
-   */
-  element: Node;
-}
-
-/**
- * An element removed by DOMPurify.
- */
-export interface RemovedAttribute {
-  /**
-   * The attribute that was removed.
-   */
-  attribute: Attr | null;
-
-  /**
-   * The element that the attribute was removed.
-   */
-  from: Node;
-}
-
-type BasicHookName =
-  | 'beforeSanitizeElements'
-  | 'afterSanitizeElements'
-  | 'uponSanitizeShadowNode';
-type ElementHookName = 'beforeSanitizeAttributes' | 'afterSanitizeAttributes';
-type DocumentFragmentHookName =
-  | 'beforeSanitizeShadowDOM'
-  | 'afterSanitizeShadowDOM';
-type UponSanitizeElementHookName = 'uponSanitizeElement';
-type UponSanitizeAttributeHookName = 'uponSanitizeAttribute';
-
-interface HooksMap {
-  beforeSanitizeElements: NodeHook[];
-  afterSanitizeElements: NodeHook[];
-  beforeSanitizeShadowDOM: DocumentFragmentHook[];
-  uponSanitizeShadowNode: NodeHook[];
-  afterSanitizeShadowDOM: DocumentFragmentHook[];
-  beforeSanitizeAttributes: ElementHook[];
-  afterSanitizeAttributes: ElementHook[];
-  uponSanitizeElement: UponSanitizeElementHook[];
-  uponSanitizeAttribute: UponSanitizeAttributeHook[];
-}
-
-export type HookName =
-  | BasicHookName
-  | ElementHookName
-  | DocumentFragmentHookName
-  | UponSanitizeElementHookName
-  | UponSanitizeAttributeHookName;
-
-export type NodeHook = (
-  this: DOMPurify,
-  currentNode: Node,
-  hookEvent: null,
-  config: Config
-) => void;
-
-export type ElementHook = (
-  this: DOMPurify,
-  currentNode: Element,
-  hookEvent: null,
-  config: Config
-) => void;
-
-export type DocumentFragmentHook = (
-  this: DOMPurify,
-  currentNode: DocumentFragment,
-  hookEvent: null,
-  config: Config
-) => void;
-
-export type UponSanitizeElementHook = (
-  this: DOMPurify,
-  currentNode: Node,
-  hookEvent: UponSanitizeElementHookEvent,
-  config: Config
-) => void;
-
-export type UponSanitizeAttributeHook = (
-  this: DOMPurify,
-  currentNode: Element,
-  hookEvent: UponSanitizeAttributeHookEvent,
-  config: Config
-) => void;
-
-export interface UponSanitizeElementHookEvent {
-  tagName: string;
-  allowedTags: Record<string, boolean>;
-}
-
-export interface UponSanitizeAttributeHookEvent {
-  attrName: string;
-  attrValue: string;
-  keepAttr: boolean;
-  allowedAttributes: Record<string, boolean>;
-  forceKeepAttr: boolean | undefined;
-}
-
-/**
- * A `Window`-like object containing the properties and types that DOMPurify requires.
- */
-export type WindowLike = Pick<
-  typeof globalThis,
-  | 'DocumentFragment'
-  | 'HTMLTemplateElement'
-  | 'Node'
-  | 'Element'
-  | 'NodeFilter'
-  | 'NamedNodeMap'
-  | 'HTMLFormElement'
-  | 'DOMParser'
-> & {
-  document?: Document;
-  MozNamedAttrMap?: typeof window.NamedNodeMap;
-} & Pick<TrustedTypesWindow, 'trustedTypes'>;
